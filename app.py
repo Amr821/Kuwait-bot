@@ -13,6 +13,10 @@ Hardened for Streamlit Community Cloud (Debian container, no root, ~1 GB RAM):
   * Playwright is pinned in requirements.txt for Python 3.14 wheels.
   * Chromium uses --no-sandbox / --disable-dev-shm-usage; images/media/fonts
     are blocked; the browser is recycled every N rows to keep memory flat.
+  * TargetClosedError hardening: no --no-zygote / VizDisplayCompositor
+    tweaks (they crash modern headless Chromium in containers), renderer
+    heap is capped, launches retry with back-off, and the scraper detects a
+    dead browser and relaunches it instead of aborting the whole job.
   * All Playwright work runs in a dedicated worker thread (avoids the
     "Sync API inside asyncio loop" error) and survives Streamlit reruns.
 
@@ -78,24 +82,87 @@ if str(_BROWSERS_DIR) != "0":
     _BROWSERS_DIR.mkdir(parents=True, exist_ok=True)
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(_BROWSERS_DIR)
 
+# Launch flags tuned for a 1 GB, no-root, no-/dev/shm container.
+#
+# Deliberately NOT used (they are the usual cause of "TargetClosedError:
+# Target page, context or browser has been closed" on Streamlit Cloud):
+#   --no-zygote                 renderer spawn fails without --single-process
+#   --single-process            one crash takes the whole browser down
+#   --disable-features=VizDisplayCompositor
+#                               Viz is mandatory in current Chromium; disabling
+#                               it kills the GPU/compositor process at start-up
 CHROMIUM_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",      # /dev/shm is tiny in containers
     "--disable-gpu",
-    "--no-zygote",
+    "--disable-software-rasterizer",
+    "--disable-accelerated-2d-canvas",
     "--no-first-run",
     "--no-default-browser-check",
+    "--no-service-autorun",
     "--disable-extensions",
+    "--disable-component-update",
     "--disable-background-networking",
     "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
-    "--disable-features=TranslateUI,AudioServiceOutOfProcess,VizDisplayCompositor",
+    "--disable-ipc-flooding-protection",
+    "--disable-hang-monitor",
+    "--disable-breakpad",
+    "--disable-crash-reporter",
+    "--disable-sync",
+    "--disable-domain-reliability",
+    "--disable-client-side-phishing-detection",
+    "--disable-popup-blocking",
+    "--disable-prompt-on-repost",
+    "--metrics-recording-only",
+    "--password-store=basic",
+    "--use-mock-keychain",
+    "--force-color-profile=srgb",
+    "--hide-scrollbars",
     "--mute-audio",
+    "--disable-features=TranslateUI,AudioServiceOutOfProcess,MediaRouter,"
+    "OptimizationHints,InterestFeedContentSuggestions",
     "--renderer-process-limit=2",
+    "--js-flags=--max-old-space-size=256",  # cap renderer heap → no OOM-kill
     "--disable-blink-features=AutomationControlled",
     "--lang=ar-KW,ar",
 ]
+LAUNCH_TIMEOUT_MS = 120_000   # first launch on Cloud can be slow (cold disk)
+LAUNCH_ATTEMPTS = 3
+# Substrings that identify a dead browser/page (Playwright wording varies).
+_CLOSED_MARKERS = (
+    "Target page, context or browser has been closed",
+    "Target closed",
+    "browser has been closed",
+    "Browser closed",
+    "Connection closed",
+    "has been closed",
+)
+
+
+def launch_kwargs() -> dict:
+    """Common `chromium.launch(**kwargs)` options for probe + scraper."""
+    return dict(
+        headless=True,
+        args=CHROMIUM_ARGS,
+        chromium_sandbox=False,
+        timeout=LAUNCH_TIMEOUT_MS,
+        # Streamlit owns the process signals; don't let the driver tear the
+        # browser down on a SIGHUP/SIGINT meant for the web server.
+        handle_sigint=False,
+        handle_sigterm=False,
+        handle_sighup=False,
+    )
+
+
+def is_closed_error(exc: BaseException) -> bool:
+    """True if `exc` means the Playwright target/browser died."""
+    if type(exc).__name__ == "TargetClosedError":
+        return True
+    msg = str(exc)
+    return any(m in msg for m in _CLOSED_MARKERS)
 BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
 
 # Extra shared libs chrome-headless-shell needs beyond Playwright's minimal
@@ -422,11 +489,7 @@ def _launch_probe() -> str:
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=CHROMIUM_ARGS,
-            chromium_sandbox=False,
-        )
+        browser = p.chromium.launch(**launch_kwargs())
         try:
             page = browser.new_page()
             page.set_content("<html><body>ok</body></html>")
@@ -539,31 +602,94 @@ def is_error(value) -> bool:
 # Scraper (must be created and used from ONE thread)
 # --------------------------------------------------------------------------- #
 class GovScraper:
-    def __init__(self, headless: bool = True, timeout_s: int = 40):
+    UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    )
+
+    def __init__(self, headless: bool = True, timeout_s: int = 40, log=None):
+        self.headless = headless
+        self.timeout_ms = timeout_s * 1000
+        self._log = log or (lambda _m: None)
+        self.relaunches = 0
+        self._pw = None
+        self.browser = None
+        self.context = None
+        self.moi_page = None
+        self.paci_page = None
+        self._paci_loaded = False
+        self._launch()
+
+    # ------------------------------------------------------------ launch --- #
+    def _launch(self):
+        """Start Playwright + Chromium with retries (Cloud launches can flake)."""
         from playwright.sync_api import sync_playwright
 
-        self.timeout_ms = timeout_s * 1000
-        self._pw = sync_playwright().start()
-        self.browser = self._pw.chromium.launch(
-            headless=headless,
-            args=CHROMIUM_ARGS,
-            chromium_sandbox=False,
-        )
-        self.context = self.browser.new_context(
-            locale="ar-KW",
-            viewport={"width": 1280, "height": 800},
-            java_script_enabled=True,
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-            ),
-        )
-        self.context.set_default_timeout(self.timeout_ms)
-        self.context.set_default_navigation_timeout(self.timeout_ms)
-        self.context.route("**/*", self._route)
-        self.moi_page = self.context.new_page()
-        self.paci_page = self.context.new_page()
+        last: Exception | None = None
+        for attempt in range(1, LAUNCH_ATTEMPTS + 1):
+            try:
+                self._pw = sync_playwright().start()
+                kw = launch_kwargs()
+                kw["headless"] = self.headless
+                self.browser = self._pw.chromium.launch(**kw)
+                self.context = self.browser.new_context(
+                    locale="ar-KW",
+                    viewport={"width": 1024, "height": 768},
+                    java_script_enabled=True,
+                    user_agent=self.UA,
+                )
+                self.context.set_default_timeout(self.timeout_ms)
+                self.context.set_default_navigation_timeout(self.timeout_ms)
+                self.context.route("**/*", self._route)
+                self.moi_page = self.context.new_page()
+                self.paci_page = self.context.new_page()
+                self._paci_loaded = False
+                return
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                self._teardown()
+                self._log(f"فشل تشغيل المتصفح (محاولة {attempt}/{LAUNCH_ATTEMPTS}): "
+                          f"{type(exc).__name__}: {exc}")
+                time.sleep(2 * attempt)
+        raise RuntimeError(f"Chromium launch failed after {LAUNCH_ATTEMPTS} attempts: {last}")
+
+    def _teardown(self):
+        for obj, fn in (
+            (self.context, "close"),
+            (self.browser, "close"),
+            (self._pw, "stop"),
+        ):
+            if obj is None:
+                continue
+            try:
+                getattr(obj, fn)()
+            except Exception:
+                pass
+        self._pw = self.browser = self.context = None
+        self.moi_page = self.paci_page = None
         self._paci_loaded = False
+
+    def alive(self) -> bool:
+        try:
+            return (
+                self.browser is not None
+                and self.browser.is_connected()
+                and self.moi_page is not None and not self.moi_page.is_closed()
+                and self.paci_page is not None and not self.paci_page.is_closed()
+            )
+        except Exception:
+            return False
+
+    def relaunch(self, reason: str = ""):
+        """Kill whatever is left and bring up a fresh browser."""
+        self.relaunches += 1
+        self._log(f"إعادة تشغيل المتصفح ({self.relaunches}) {reason}".rstrip())
+        self._teardown()
+        self._launch()
+
+    def ensure_alive(self):
+        if not self.alive():
+            self.relaunch("— المتصفح أُغلق أو تعطل")
 
     @staticmethod
     def _route(route, request):
@@ -669,6 +795,7 @@ class GovScraper:
         last = ERR_GENERIC
         for attempt in range(retries + 1):
             try:
+                self.ensure_alive()
                 out = fn(civil_id)
                 if out != ERR_TIMEOUT or attempt == retries:
                     return out
@@ -676,15 +803,23 @@ class GovScraper:
             except Exception as exc:  # noqa: BLE001
                 last = f"{ERR_GENERIC}: {type(exc).__name__}"
                 self._paci_loaded = False
+                if is_closed_error(exc):
+                    # Browser/renderer died (OOM, crash). Relaunch and give the
+                    # same row one more chance instead of failing the job.
+                    try:
+                        self.relaunch(f"— {type(exc).__name__}")
+                    except Exception as launch_exc:  # noqa: BLE001
+                        return f"{ERR_GENERIC}: {type(launch_exc).__name__}"
+                    if attempt == retries:
+                        try:
+                            return fn(civil_id)
+                        except Exception as exc2:  # noqa: BLE001
+                            return f"{ERR_GENERIC}: {type(exc2).__name__}"
             time.sleep(1.5)
         return last
 
     def close(self):
-        for fn in (self.context.close, self.browser.close, self._pw.stop):
-            try:
-                fn()
-            except Exception:
-                pass
+        self._teardown()
 
 
 # --------------------------------------------------------------------------- #
@@ -733,7 +868,7 @@ class ScrapeJob:
         o = self.opts
         scraper = None
         try:
-            scraper = GovScraper(headless=o["headless"], timeout_s=o["timeout_s"])
+            scraper = GovScraper(headless=o["headless"], timeout_s=o["timeout_s"], log=self.log)
             self.log("تم تشغيل Chromium.")
             rows_since_restart = 0
 
@@ -754,10 +889,10 @@ class ScrapeJob:
                     continue
 
                 if rows_since_restart >= o["restart_every"]:
-                    scraper.close()
-                    scraper = GovScraper(headless=o["headless"], timeout_s=o["timeout_s"])
+                    scraper.relaunch("— لتحرير الذاكرة")
                     rows_since_restart = 0
-                    self.log("تمت إعادة تشغيل المتصفح لتحرير الذاكرة.")
+                elif not scraper.alive():
+                    scraper.relaunch("— المتصفح أُغلق أو تعطل")
 
                 if o["do_moi"] and self._needs(idx, COL_MOI):
                     val = scraper.safe(scraper.moi_fines, cid, o["retries"])
@@ -836,7 +971,8 @@ with st.sidebar:
     timeout_s = st.slider("مهلة انتظار النتيجة (ثانية)", 10, 120, 45)
     delay_s = st.slider("فاصل زمني بين كل رقم مدني (ثانية)", 0.0, 10.0, 2.0, 0.5)
     retries = st.slider("عدد إعادة المحاولة عند انتهاء المهلة", 0, 3, 1)
-    restart_every = st.slider("إعادة تشغيل المتصفح كل N صف (لتوفير الذاكرة)", 10, 200, 40, 10)
+    restart_every = st.slider("إعادة تشغيل المتصفح كل N صف (لتوفير الذاكرة)", 10, 200,
+                              20 if ON_CLOUD else 40, 10)
     skip_filled = st.checkbox("تخطي الخلايا المعبأة مسبقاً", value=True)
     st.markdown("---")
     st.markdown("**الخدمات:**")
