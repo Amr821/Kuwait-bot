@@ -109,8 +109,6 @@ CHROMIUM_ARGS = [
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",      # /dev/shm is tiny in containers
     "--disable-gpu",
-    "--disable-software-rasterizer",
-    "--disable-accelerated-2d-canvas",
     "--no-first-run",
     "--no-default-browser-check",
     "--no-service-autorun",
@@ -135,10 +133,12 @@ CHROMIUM_ARGS = [
     "--force-color-profile=srgb",
     "--hide-scrollbars",
     "--mute-audio",
+    # No site isolation: the reCAPTCHA iframes on both sites would otherwise
+    # get their own renderer processes (3–4 renderers on a 1 GB box → OOM).
+    "--disable-site-isolation-trials",
     "--disable-features=TranslateUI,AudioServiceOutOfProcess,MediaRouter,"
-    "OptimizationHints,InterestFeedContentSuggestions",
+    "OptimizationHints,InterestFeedContentSuggestions,IsolateOrigins,site-per-process",
     "--renderer-process-limit=2",
-    "--js-flags=--max-old-space-size=256",  # cap renderer heap → no OOM-kill
     "--disable-blink-features=AutomationControlled",
     "--lang=ar-KW,ar",
 ]
@@ -152,6 +152,8 @@ _CLOSED_MARKERS = (
     "Browser closed",
     "Connection closed",
     "has been closed",
+    "Page crashed",
+    "crashed",
 )
 
 
@@ -215,7 +217,15 @@ _CHROMIUM_APT_PACKAGES = (
     "libpng16-16t64",
     "zlib1g",
 )
-_SYSLIB_MARKER = ".ok.v3"  # bump to force re-vendor when the package set grows
+# Chromium's renderer CHECK-fails on its first text layout when fontconfig
+# finds *zero* fonts (slim Cloud image). The launch probe with a blank page
+# passes, and the very first goto/click dies with TargetClosedError. So we
+# vendor a Latin + Arabic font set and point fontconfig at it (no root).
+_FONT_APT_PACKAGES = (
+    "fonts-dejavu-core",   # Latin/Greek/Cyrillic (arch: all)
+    "fonts-noto-core",     # Noto Sans/Naskh Arabic + many scripts (arch: all)
+)
+_SYSLIB_MARKER = ".ok.v4"  # bump to force re-vendor when the package set grows
 # Fallbacks if the host is older than trixie (no t64 package names).
 _CHROMIUM_APT_FALLBACKS = {
     "libasound2t64": "libasound2",
@@ -351,16 +361,56 @@ def _resolve_deb_url(pkg: str, suite: str = "trixie") -> str | None:
     return (preferred or hrefs or [None])[0]
 
 
-def _extract_deb(deb_path: Path, root: Path) -> bool:
-    code, _ = _run(["dpkg-deb", "-x", str(deb_path), str(root)], timeout=120)
-    if code == 0:
+def _extract_deb_python(deb_path: Path, root: Path) -> bool:
+    """Pure-Python .deb extraction (ar archive → data.tar.{xz,gz,bz2,zst})."""
+    import tarfile
+
+    data = deb_path.read_bytes()
+    if not data.startswith(b"!<arch>\n"):
+        return False
+    pos = 8
+    while pos + 60 <= len(data):
+        name = data[pos:pos + 16].decode("ascii", "replace").strip()
+        size = int(data[pos + 48:pos + 58].decode("ascii").strip() or "0")
+        body = data[pos + 60:pos + 60 + size]
+        pos += 60 + size + (size & 1)
+        if not name.startswith("data.tar"):
+            continue
+        if name.endswith(".zst"):
+            try:
+                from compression import zstd  # Python ≥ 3.14
+            except ImportError:
+                return False
+            body = zstd.decompress(body)
+            mode = "r:"
+        else:
+            mode = "r:*"
+        with tarfile.open(fileobj=io.BytesIO(body), mode=mode) as tar:
+            members = [m for m in tar.getmembers()
+                       if not (m.name.startswith("/") or ".." in m.name.split("/"))]
+            try:
+                tar.extractall(root, members=members, filter="fully_trusted")
+            except TypeError:  # Python < 3.12: no `filter`
+                tar.extractall(root, members=members)
         return True
-    code2, _ = _run(
-        ["bash", "-lc", f"cd {deb_path.parent} && ar x {deb_path.name} && "
-         f"tar -xf data.tar.* -C {root}"],
-        timeout=120,
-    )
-    return code2 == 0
+    return False
+
+
+def _extract_deb(deb_path: Path, root: Path) -> bool:
+    for cmd in (
+        ["dpkg-deb", "-x", str(deb_path), str(root)],
+        ["bash", "-lc", f"cd {deb_path.parent} && ar x {deb_path.name} && tar -xf data.tar.* -C {root}"],
+    ):
+        try:
+            code, _ = _run(cmd, timeout=120)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        if code == 0:
+            return True
+    try:
+        return _extract_deb_python(deb_path, root)
+    except Exception:
+        return False
 
 
 def _syslib_root() -> Path:
@@ -427,13 +477,14 @@ def _vendor_syslibs_from_debs(extra_pkgs: tuple[str, ...] = ()) -> str:
     lib_ok = (root / "usr" / "lib" / "x86_64-linux-gnu").exists() or (
         root / "lib" / "x86_64-linux-gnu"
     ).exists()
-    pkgs = tuple(dict.fromkeys((*_CHROMIUM_APT_PACKAGES, *extra_pkgs)))
+    pkgs = tuple(dict.fromkeys((*_CHROMIUM_APT_PACKAGES, *_FONT_APT_PACKAGES, *extra_pkgs)))
 
     # Reuse cache only when marker matches current package-set generation and
     # no extra packages were requested.
     if marker.exists() and lib_ok and not extra_pkgs:
         _prepend_ld_path(root)
-        return f"syslibs ready: {root}"
+        _setup_fontconfig(root)
+        return f"syslibs ready: {root} ({_font_count(root)} fonts)"
 
     root.mkdir(parents=True, exist_ok=True)
     log: list[str] = []
@@ -452,6 +503,8 @@ def _vendor_syslibs_from_debs(extra_pkgs: tuple[str, ...] = ()) -> str:
             return "syslib vendor failed — no lib dir\n" + "\n".join(log)
 
         _prepend_ld_path(root)
+        _setup_fontconfig(root)
+        log.append(f"fonts available: {_font_count(root)}")
         # Drop stale markers from older package sets.
         for old in root.glob(".ok*"):
             old.unlink(missing_ok=True)
@@ -492,6 +545,94 @@ def _prepend_ld_path(root: Path) -> None:
     os.environ["LD_LIBRARY_PATH"] = ":".join(parts)
 
 
+def _font_count(root: Path) -> int:
+    dirs = [root / "usr" / "share" / "fonts", Path("/usr/share/fonts"), Path("/usr/local/share/fonts")]
+    n = 0
+    for d in dirs:
+        if d.is_dir():
+            n += sum(1 for f in d.rglob("*") if f.suffix.lower() in (".ttf", ".otf", ".ttc"))
+    return n
+
+
+def _setup_fontconfig(root: Path) -> None:
+    """Write a self-contained fonts.conf and export FONTCONFIG_* for Chromium.
+
+    The vendored libfontconfig looks for /etc/fonts/fonts.conf, which slim
+    images lack ("Cannot load default config file") → no fonts → renderer
+    crash on first layout. Our own config lists the vendored font dir plus
+    the usual system dirs and keeps the cache under the writable root.
+    """
+    if not IS_LINUX:
+        return
+    conf_dir = root / "etc" / "fonts"
+    cache_dir = root / "fc-cache"
+    conf_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    conf = conf_dir / "fonts.conf"
+    conf.write_text(
+        f"""<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <dir>{root / "usr" / "share" / "fonts"}</dir>
+  <dir>/usr/share/fonts</dir>
+  <dir>/usr/local/share/fonts</dir>
+  <dir prefix="xdg">fonts</dir>
+  <cachedir>{cache_dir}</cachedir>
+  <alias><family>sans-serif</family><prefer>
+    <family>DejaVu Sans</family><family>Noto Sans</family><family>Noto Sans Arabic</family>
+  </prefer></alias>
+  <alias><family>serif</family><prefer>
+    <family>DejaVu Serif</family><family>Noto Serif</family><family>Noto Naskh Arabic</family>
+  </prefer></alias>
+  <alias><family>monospace</family><prefer><family>DejaVu Sans Mono</family></prefer></alias>
+  <alias><family>Arial</family><prefer><family>DejaVu Sans</family></prefer></alias>
+  <alias><family>Tahoma</family><prefer><family>DejaVu Sans</family><family>Noto Sans Arabic</family></prefer></alias>
+</fontconfig>
+""",
+        encoding="utf-8",
+    )
+    os.environ["FONTCONFIG_FILE"] = str(conf)
+    os.environ["FONTCONFIG_PATH"] = str(conf_dir)
+
+
+_PROBE_HTML = (
+    "<html><body><p>probe — اختبار المتصفح</p>"
+    "<input id='civ' placeholder='الرقم المدني'><button id='go'>استعلام</button>"
+    "</body></html>"
+)
+
+
+def _executable_path() -> str:
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        return p.chromium.executable_path or ""
+
+
+def _raw_chromium_smoke() -> str:
+    """Run the Chromium binary directly and return its own stderr.
+
+    Playwright only reports "Target closed"; Chromium's stderr carries the
+    real reason (fontconfig errors, CHECK failures, missing GL, OOM…).
+    """
+    try:
+        exe = _in_thread(_executable_path)
+    except Exception as exc:  # noqa: BLE001
+        return f"executable lookup failed: {exc}"
+    if not exe or not Path(exe).exists():
+        return f"executable missing: {exe!r}"
+    cmd = [exe, "--headless", *[a for a in CHROMIUM_ARGS if not a.startswith("--lang")],
+           "--enable-logging=stderr", "--v=0", "--dump-dom",
+           "data:text/html;charset=utf-8,<p>probe%20%D8%A7%D8%AE%D8%AA%D8%A8%D8%A7%D8%B1</p>"]
+    try:
+        code, out = _run(cmd, timeout=90)
+    except subprocess.TimeoutExpired:
+        return "raw chromium smoke: TIMEOUT"
+    except Exception as exc:  # noqa: BLE001
+        return f"raw chromium smoke failed to start: {exc}"
+    return f"raw chromium smoke: exit {code}\n{out[-1500:]}"
+
+
 def _launch_probe() -> str:
     """Start Chromium briefly; return its executable path on success.
 
@@ -504,8 +645,16 @@ def _launch_probe() -> str:
     with sync_playwright() as p:
         browser = p.chromium.launch(**launch_kwargs())
         try:
-            page = browser.new_page()
-            page.set_content("<html><body>ok</body></html>")
+            # Do what the first real row does: layout (innerText), visibility
+            # checks, typing into an input, a click and a paint (screenshot).
+            # A renderer that dies here would die on row 1 with TargetClosed.
+            page = browser.new_page(locale="ar-KW")
+            page.set_content(_PROBE_HTML)
+            page.evaluate("() => document.body.innerText")
+            page.wait_for_selector("#civ", state="visible", timeout=10_000)
+            page.fill("#civ", "200000000000")
+            page.click("#go")
+            page.screenshot(type="png")
             return p.chromium.executable_path or "chromium"
         finally:
             browser.close()
@@ -573,10 +722,12 @@ def ensure_chromium() -> str:
 
     launch_err = _last_launch_error()
     raise RuntimeError(
-        "Chromium downloaded but headless launch failed (usually missing "
-        "shared libraries). Syslib vendoring from Debian .debs should supply "
-        "them without packages.txt.\n"
-        f"Launch error: {launch_err}\n" + "\n".join(notes)
+        "Chromium downloaded but the headless probe failed (missing shared "
+        "libraries, no fonts, or a renderer crash).\n"
+        f"Launch error: {launch_err}\n"
+        f"{_raw_chromium_smoke()}\n"
+        f"FONTCONFIG_FILE={os.environ.get('FONTCONFIG_FILE', '')}\n"
+        + "\n".join(notes)
     )
 
 
@@ -730,6 +881,9 @@ class GovScraper:
                 self.context.route("**/*", self._route)
                 self.moi_page = self.context.new_page()
                 self.paci_page = self.context.new_page()
+                self.crashes = 0
+                for name, pg in (("MOI", self.moi_page), ("PACI", self.paci_page)):
+                    pg.on("crash", lambda _pg, n=name: self._on_crash(n))
                 self._paci_loaded = False
                 self.op_deadline = None
                 return
@@ -741,6 +895,10 @@ class GovScraper:
                 time.sleep(2 * attempt)
         self.op_deadline = None
         raise RuntimeError(f"Chromium launch failed after {LAUNCH_ATTEMPTS} attempts: {last}")
+
+    def _on_crash(self, name: str):
+        self.crashes = getattr(self, "crashes", 0) + 1
+        self._log(f"💥 تعطل محرك العرض لصفحة {name} (renderer crash) — سيُعاد تشغيل المتصفح.")
 
     def _teardown(self):
         for obj, fn in (
@@ -1120,6 +1278,45 @@ class ScrapeJob:
 
 
 # --------------------------------------------------------------------------- #
+# One-ID diagnostic (sidebar) – shows the real exception instead of a cell
+# --------------------------------------------------------------------------- #
+def run_quick_test(civil_id: str, timeout_s: int) -> str:
+    import traceback
+
+    lines: list[str] = []
+    logs: list[str] = []
+    t_all = time.monotonic()
+    try:
+        s = GovScraper(headless=True, timeout_s=timeout_s, log=logs.append)
+    except Exception:  # noqa: BLE001
+        return "فشل تشغيل المتصفح:\n" + traceback.format_exc() + "\n" + "\n".join(logs)
+    try:
+        for label, fn in (("الداخلية", s.moi_fines), ("حالة البطاقة", s.paci_card_status),
+                          ("تجديد البطاقة", s.paci_card_renewal)):
+            t0 = time.monotonic()
+            try:
+                out = fn(civil_id)
+                lines.append(f"✅ {label} ({time.monotonic() - t0:.1f}s): {out}")
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"❌ {label} ({time.monotonic() - t0:.1f}s): {type(exc).__name__}: {exc}")
+                lines.append(traceback.format_exc()[-1500:])
+                lines.append(f"browser connected: {s.alive()} | renderer crashes: {getattr(s, 'crashes', 0)}")
+                for name, pg in (("MOI", s.moi_page), ("PACI", s.paci_page)):
+                    try:
+                        lines.append(f"{name} page: closed={pg.is_closed()} url={pg.url}")
+                    except Exception as e2:  # noqa: BLE001
+                        lines.append(f"{name} page: {type(e2).__name__}")
+                if is_closed_error(exc):
+                    s.relaunch("— quick test")
+        lines.append(f"المجموع: {time.monotonic() - t_all:.1f}s | relaunches={s.relaunches}")
+    finally:
+        s.close()
+    if IS_LINUX:
+        lines.append(f"fonts: {_font_count(_syslib_root())} | FONTCONFIG_FILE={os.environ.get('FONTCONFIG_FILE', '-')}")
+    return "\n".join(lines + ["", *logs])
+
+
+# --------------------------------------------------------------------------- #
 # Excel export
 # --------------------------------------------------------------------------- #
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
@@ -1206,6 +1403,18 @@ with st.sidebar:
                 f"تدخلات المراقب: {job.watchdog_kills}\n"
                 f"فترات تهدئة: {job.cooldowns}"
             )
+        st.caption("سجل تجهيز المتصفح الكامل:")
+        st.code(boot_msg, language="text")
+    with st.expander("🔬 اختبار سريع لرقم واحد"):
+        st.caption("يستعلم عن رقم واحد ويعرض الخطأ الكامل إن حدث (مفيد لتشخيص TargetClosedError).")
+        test_cid = normalize_civil_id(st.text_input("الرقم المدني للاختبار", value=""))
+        if st.button("▶ تشغيل الاختبار", disabled=running or len(test_cid) != 12):
+            with st.spinner("جاري الاختبار…"):
+                try:
+                    report = _in_thread(lambda: run_quick_test(test_cid, timeout_s))
+                except Exception as exc:  # noqa: BLE001
+                    report = f"{type(exc).__name__}: {exc}"
+            st.code(report, language="text")
 
 ss = st.session_state
 ss.setdefault("input_df", None)
