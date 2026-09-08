@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+import os
+os.system("playwright install chromium")
 """
 Streamlit app: bulk lookup of Kuwait MOI residence fines and PACI card status /
 card renewal for a list of Civil IDs supplied in an Excel file.
