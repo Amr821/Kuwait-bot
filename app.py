@@ -17,6 +17,19 @@ Hardened for Streamlit Community Cloud (Debian container, no root, ~1 GB RAM):
     tweaks (they crash modern headless Chromium in containers), renderer
     heap is capped, launches retry with back-off, and the scraper detects a
     dead browser and relaunches it instead of aborting the whole job.
+  * Long-run (700+ rows) hardening:
+      - a watchdog thread kills Chromium if any single lookup blocks past
+        2×timeout+30 s, so a wedged renderer/driver can never hang the job;
+      - wait_for_function uses interval polling (rAF polling stalls in
+        background/occluded headless windows → every row "times out");
+      - MOI serves a WAF/error page → detected in ≤15 s, not a full timeout;
+      - circuit breaker: 5 consecutive all-error rows → relaunch + back-off,
+        40 → abort with a clear message instead of "hanging" for hours;
+      - the job lives in a process-wide registry (st.cache_resource), so a
+        reload / dropped websocket re-attaches instead of starting a second
+        browser (two Chromiums on 1 GB = OOM = TargetClosedError);
+      - progress UI is a non-blocking st.fragment that ships only a window
+        of rows, not all 735 every second.
   * All Playwright work runs in a dedicated worker thread (avoids the
     "Sync API inside asyncio loop" error) and survives Streamlit reruns.
 
@@ -601,6 +614,75 @@ def is_error(value) -> bool:
 # --------------------------------------------------------------------------- #
 # Scraper (must be created and used from ONE thread)
 # --------------------------------------------------------------------------- #
+ERR_BLOCKED = "⚠ الموقع لم يستجب (صفحة غير متوقعة)"
+RETRYABLE = (ERR_TIMEOUT, ERR_BLOCKED)
+POLL_MS = 250          # wait_for_function interval; rAF polling stalls in background windows
+FORM_WAIT_MS = 15_000  # how long the MOI form itself may take to appear
+
+
+def _descendant_pids(root_pid: int) -> list[int]:
+    """PIDs of every process under `root_pid` (Linux via /proc, else `ps`)."""
+    children: dict[int, list[int]] = {}
+    try:
+        if IS_LINUX:
+            for d in Path("/proc").iterdir():
+                if not d.name.isdigit():
+                    continue
+                try:
+                    stat = (d / "stat").read_text()
+                    ppid = int(stat.rsplit(")", 1)[1].split()[1])
+                except Exception:
+                    continue
+                children.setdefault(ppid, []).append(int(d.name))
+        else:
+            out = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True, text=True, timeout=10).stdout
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) == 2:
+                    children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    except Exception:
+        return []
+    found, stack = [], [root_pid]
+    while stack:
+        p = stack.pop()
+        for c in children.get(p, []):
+            found.append(c)
+            stack.append(c)
+    return found
+
+
+def _cmdline(pid: int) -> str:
+    try:
+        if IS_LINUX:
+            return (Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")).decode("utf-8", "replace")
+        return subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return ""
+
+
+def kill_chromium_processes() -> int:
+    """SIGKILL every Chromium descended from this process. Returns the count.
+
+    Used by the watchdog when a Playwright call exceeds its hard deadline: the
+    pending call then fails with TargetClosedError and the scraper relaunches.
+    Only Chromium is killed – the Node driver stays up and reports the loss.
+    """
+    import signal
+
+    killed = 0
+    for pid in _descendant_pids(os.getpid()):
+        # Browser binaries: chrome, chrome-headless-shell, headless_shell under
+        # .../chromium_headless_shell-NNNN/. The Node driver never matches.
+        cmd = _cmdline(pid).lower()
+        if "chrom" in cmd or "headless_shell" in cmd:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+            except Exception:
+                pass
+    return killed
+
+
 class GovScraper:
     UA = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -610,8 +692,12 @@ class GovScraper:
     def __init__(self, headless: bool = True, timeout_s: int = 40, log=None):
         self.headless = headless
         self.timeout_ms = timeout_s * 1000
+        # One lookup = at most goto + wait (each ≤ timeout) + slack. If Playwright
+        # is still blocked past this, the watchdog kills Chromium.
+        self.hard_limit_s = timeout_s * 2 + 30
         self._log = log or (lambda _m: None)
         self.relaunches = 0
+        self.op_deadline: float | None = None   # monotonic; read by the watchdog
         self._pw = None
         self.browser = None
         self.context = None
@@ -627,6 +713,7 @@ class GovScraper:
 
         last: Exception | None = None
         for attempt in range(1, LAUNCH_ATTEMPTS + 1):
+            self.op_deadline = time.monotonic() + LAUNCH_TIMEOUT_MS / 1000 + 30
             try:
                 self._pw = sync_playwright().start()
                 kw = launch_kwargs()
@@ -644,6 +731,7 @@ class GovScraper:
                 self.moi_page = self.context.new_page()
                 self.paci_page = self.context.new_page()
                 self._paci_loaded = False
+                self.op_deadline = None
                 return
             except Exception as exc:  # noqa: BLE001
                 last = exc
@@ -651,6 +739,7 @@ class GovScraper:
                 self._log(f"فشل تشغيل المتصفح (محاولة {attempt}/{LAUNCH_ATTEMPTS}): "
                           f"{type(exc).__name__}: {exc}")
                 time.sleep(2 * attempt)
+        self.op_deadline = None
         raise RuntimeError(f"Chromium launch failed after {LAUNCH_ATTEMPTS} attempts: {last}")
 
     def _teardown(self):
@@ -685,6 +774,7 @@ class GovScraper:
         self.relaunches += 1
         self._log(f"إعادة تشغيل المتصفح ({self.relaunches}) {reason}".rstrip())
         self._teardown()
+        kill_chromium_processes()  # nothing survives a relaunch (no zombie RAM)
         self._launch()
 
     def ensure_alive(self):
@@ -700,7 +790,22 @@ class GovScraper:
     # ---------------------------------------------------------------- MOI --- #
     def moi_fines(self, civil_id: str) -> str:
         page = self.moi_page
-        page.goto(MOI_URL + civil_id, wait_until="load")
+        # domcontentloaded: don't wait for every third-party script/tracker to
+        # finish; the readiness check below is what actually matters.
+        page.goto(MOI_URL + civil_id, wait_until="domcontentloaded")
+
+        # Fail fast when the site serves a WAF/maintenance/error page instead of
+        # the enquiry form – otherwise every row burns the full timeout.
+        try:
+            page.wait_for_selector("#civilId", state="attached",
+                                   timeout=min(FORM_WAIT_MS, self.timeout_ms))
+        except Exception:
+            title = ""
+            try:
+                title = page.title()
+            except Exception:
+                pass
+            return f"{ERR_BLOCKED}: {title[:60]}" if title else ERR_BLOCKED
 
         js_ready = """
         () => {
@@ -713,7 +818,7 @@ class GovScraper:
         }
         """
         try:
-            page.wait_for_function(js_ready, timeout=self.timeout_ms)
+            page.wait_for_function(js_ready, timeout=self.timeout_ms, polling=POLL_MS)
         except Exception:
             return ERR_TIMEOUT
 
@@ -732,13 +837,14 @@ class GovScraper:
     def _ensure_paci(self, force: bool = False):
         page = self.paci_page
         if force or not self._paci_loaded or "services.paci.gov.kw" not in page.url:
-            page.goto(PACI_URL, wait_until="load")
+            self._paci_loaded = False
+            page.goto(PACI_URL, wait_until="domcontentloaded")
             page.wait_for_selector("#txtCivilId", state="visible")
             page.wait_for_selector("#btnSearch", state="visible")
             try:  # give reCAPTCHA v3 a moment to populate the hidden token
                 page.wait_for_function(
                     "() => ((document.querySelector('#Token')||{}).value||'').length > 20",
-                    timeout=15000,
+                    timeout=15000, polling=POLL_MS,
                 )
             except Exception:
                 pass
@@ -752,7 +858,7 @@ class GovScraper:
         page.wait_for_function(
             "(t) => (document.querySelector('#InquiryType')||{}).value === t",
             arg=inquiry_type,
-            timeout=5000,
+            timeout=5000, polling=POLL_MS,
         )
         page.evaluate(
             """() => {
@@ -774,7 +880,7 @@ class GovScraper:
         }
         """
         try:
-            page.wait_for_function(js_ready, timeout=self.timeout_ms)
+            page.wait_for_function(js_ready, timeout=self.timeout_ms, polling=POLL_MS)
         except Exception:
             self._paci_loaded = False
             return ERR_TIMEOUT
@@ -791,28 +897,36 @@ class GovScraper:
         return self._paci_query(civil_id, "srv1", "1")
 
     # ------------------------------------------------------------ generic --- #
+    def _guarded(self, fn, civil_id: str) -> str:
+        """Run one lookup under the watchdog deadline."""
+        self.op_deadline = time.monotonic() + self.hard_limit_s
+        try:
+            return fn(civil_id)
+        finally:
+            self.op_deadline = None
+
     def safe(self, fn, civil_id: str, retries: int = 1) -> str:
         last = ERR_GENERIC
         for attempt in range(retries + 1):
             try:
                 self.ensure_alive()
-                out = fn(civil_id)
-                if out != ERR_TIMEOUT or attempt == retries:
+                out = self._guarded(fn, civil_id)
+                if not out.startswith(RETRYABLE) or attempt == retries:
                     return out
                 last = out
             except Exception as exc:  # noqa: BLE001
                 last = f"{ERR_GENERIC}: {type(exc).__name__}"
                 self._paci_loaded = False
                 if is_closed_error(exc):
-                    # Browser/renderer died (OOM, crash). Relaunch and give the
-                    # same row one more chance instead of failing the job.
+                    # Browser/renderer died (OOM, crash, watchdog kill). Relaunch
+                    # and give the same row one more chance instead of failing.
                     try:
                         self.relaunch(f"— {type(exc).__name__}")
                     except Exception as launch_exc:  # noqa: BLE001
                         return f"{ERR_GENERIC}: {type(launch_exc).__name__}"
                     if attempt == retries:
                         try:
-                            return fn(civil_id)
+                            return self._guarded(fn, civil_id)
                         except Exception as exc2:  # noqa: BLE001
                             return f"{ERR_GENERIC}: {type(exc2).__name__}"
             time.sleep(1.5)
@@ -820,11 +934,19 @@ class GovScraper:
 
     def close(self):
         self._teardown()
+        kill_chromium_processes()
 
 
 # --------------------------------------------------------------------------- #
-# Background job (thread) – survives Streamlit reruns
+# Background job (thread) – survives Streamlit reruns and page reloads
 # --------------------------------------------------------------------------- #
+FAIL_ROWS_PER_COOLDOWN = 5     # consecutive all-error rows before a relaunch + pause
+MAX_FAIL_ROWS = 40             # give up after this many consecutive all-error rows
+COOLDOWN_BASE_S = 30
+COOLDOWN_MAX_S = 300
+WATCHDOG_TICK_S = 5
+
+
 class ScrapeJob:
     def __init__(self, df: pd.DataFrame, opts: dict):
         self.df = df
@@ -832,20 +954,43 @@ class ScrapeJob:
         self.total = len(df)
         self.processed = 0
         self.current = ""
+        self.started_at = datetime.now()
+        self.finished_at: datetime | None = None
         self.logs: list[str] = []
         self.error: str | None = None
+        self.consecutive_fail_rows = 0
+        self.cooldowns = 0
+        self.watchdog_kills = 0
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.done = threading.Event()
+        self.scraper: GovScraper | None = None
+        self._excel_cache: tuple[int, bytes] | None = None
         self.thread = threading.Thread(target=self._run, name="scraper", daemon=True)
+        self.watchdog = threading.Thread(target=self._watchdog, name="scraper-watchdog", daemon=True)
 
     # -- API used by the UI thread --
     def start(self):
         self.thread.start()
+        self.watchdog.start()
+
+    @property
+    def running(self) -> bool:
+        return not self.done.is_set()
 
     def snapshot(self) -> pd.DataFrame:
         with self.lock:
             return self.df.copy()
+
+    def excel_bytes(self) -> bytes:
+        """Excel of the current state; rebuilt only when progress changed."""
+        key = self.processed if self.running else -1
+        cache = self._excel_cache
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        data = to_excel_bytes(self.snapshot())
+        self._excel_cache = (key, data)
+        return data
 
     def log(self, msg: str):
         with self.lock:
@@ -863,12 +1008,40 @@ class ScrapeJob:
             return True
         return not (isinstance(cur, str) and cur.strip() and not is_error(cur))
 
+    # -- watchdog: no Playwright call may block past its hard deadline --
+    def _watchdog(self):
+        while not self.done.wait(WATCHDOG_TICK_S):
+            s = self.scraper
+            deadline = s.op_deadline if s is not None else None
+            if deadline is None or time.monotonic() < deadline:
+                continue
+            s.op_deadline = None
+            n = kill_chromium_processes()
+            self.watchdog_kills += 1
+            self.log(f"⏱ المراقب: تجاوز الحد الأقصى للعملية — تم إنهاء Chromium ({n} عملية) وسيُعاد تشغيله.")
+
+    def _cooldown(self, scraper: GovScraper):
+        self.cooldowns += 1
+        wait = min(COOLDOWN_BASE_S * (2 ** (self.cooldowns - 1)), COOLDOWN_MAX_S)
+        self.log(f"⚠ {self.consecutive_fail_rows} صفوف متتالية بلا نتيجة — إعادة تشغيل المتصفح والانتظار {wait} ث.")
+        try:
+            scraper.relaunch("— بعد فشل متكرر")
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"تعذر إعادة التشغيل: {type(exc).__name__}: {exc}")
+        self.stop_event.wait(wait)
+
     # -- worker --
     def _run(self):
         o = self.opts
+        services = [
+            (COL_MOI, o["do_moi"], "moi_fines", "الداخلية"),
+            (COL_STATUS, o["do_status"], "paci_card_status", "حالة البطاقة"),
+            (COL_RENEW, o["do_renew"], "paci_card_renewal", "تجديد البطاقة"),
+        ]
         scraper = None
         try:
             scraper = GovScraper(headless=o["headless"], timeout_s=o["timeout_s"], log=self.log)
+            self.scraper = scraper
             self.log("تم تشغيل Chromium.")
             rows_since_restart = 0
 
@@ -881,7 +1054,7 @@ class ScrapeJob:
                 self.current = cid or "—"
 
                 if not cid or len(cid) != 12:
-                    for col, enabled in ((COL_MOI, o["do_moi"]), (COL_STATUS, o["do_status"]), (COL_RENEW, o["do_renew"])):
+                    for col, enabled, _fn, _lbl in services:
                         if enabled:
                             self._set(idx, col, ERR_BAD_ID)
                     self.log(f"{cid!r}: رقم مدني غير صالح - تم التخطي")
@@ -894,27 +1067,46 @@ class ScrapeJob:
                 elif not scraper.alive():
                     scraper.relaunch("— المتصفح أُغلق أو تعطل")
 
-                if o["do_moi"] and self._needs(idx, COL_MOI):
-                    val = scraper.safe(scraper.moi_fines, cid, o["retries"])
-                    self._set(idx, COL_MOI, val)
-                    self.log(f"{cid} | الداخلية: {val}")
-
-                if o["do_status"] and self._needs(idx, COL_STATUS):
-                    val = scraper.safe(scraper.paci_card_status, cid, o["retries"])
-                    self._set(idx, COL_STATUS, val)
-                    self.log(f"{cid} | حالة البطاقة: {val}")
-
-                if o["do_renew"] and self._needs(idx, COL_RENEW):
-                    val = scraper.safe(scraper.paci_card_renewal, cid, o["retries"])
-                    self._set(idx, COL_RENEW, val)
-                    self.log(f"{cid} | تجديد البطاقة: {val}")
+                t0 = time.monotonic()
+                attempted = errors = 0
+                for col, enabled, fn_name, label in services:
+                    if self.stop_event.is_set():
+                        break
+                    if not enabled or not self._needs(idx, col):
+                        continue
+                    val = scraper.safe(getattr(scraper, fn_name), cid, o["retries"])
+                    self._set(idx, col, val)
+                    attempted += 1
+                    errors += is_error(val)
+                    self.log(f"{cid} | {label}: {val}")
 
                 self.processed = i
                 rows_since_restart += 1
-                if o["delay_s"]:
-                    time.sleep(o["delay_s"])
+                self.log(f"{cid} | الصف {i}/{self.total} في {time.monotonic() - t0:.1f} ث")
 
-            self.log("انتهى التنفيذ.")
+                # Circuit breaker: a site that stopped answering should not cost
+                # 735 × timeout. Pause with back-off, then give up with a clear
+                # message instead of looking "hung" for hours.
+                if attempted and errors == attempted:
+                    self.consecutive_fail_rows += 1
+                    if self.consecutive_fail_rows >= MAX_FAIL_ROWS:
+                        raise RuntimeError(
+                            f"{MAX_FAIL_ROWS} صفاً متتالياً بلا أي نتيجة — يبدو أن الموقع يحظر "
+                            "الطلبات أو متوقف. حمّل النتائج الجزئية وأعد المحاولة لاحقاً "
+                            "(مع تفعيل 'تخطي الخلايا المعبأة')."
+                        )
+                    if self.consecutive_fail_rows % FAIL_ROWS_PER_COOLDOWN == 0:
+                        self._cooldown(scraper)
+                        rows_since_restart = 0
+                elif attempted:
+                    self.consecutive_fail_rows = 0
+                    self.cooldowns = 0
+
+                if o["delay_s"] and not self.stop_event.is_set():
+                    self.stop_event.wait(o["delay_s"])
+
+            if not self.stop_event.is_set():
+                self.log("انتهى التنفيذ.")
         except Exception as exc:  # noqa: BLE001
             self.error = f"{type(exc).__name__}: {exc}"
             self.log(f"خطأ عام: {self.error}")
@@ -922,6 +1114,8 @@ class ScrapeJob:
             if scraper:
                 scraper.close()
                 self.log("تم إغلاق المتصفح.")
+            self.scraper = None
+            self.finished_at = datetime.now()
             self.done.set()
 
 
@@ -938,6 +1132,26 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
             width = max(len(str(c.value)) if c.value is not None else 0 for c in col_cells)
             ws.column_dimensions[col_cells[0].column_letter].width = min(max(14, width + 2), 80)
     return buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# Process-wide job registry
+# --------------------------------------------------------------------------- #
+# One container = one Chromium budget. The job lives here (not in
+# session_state) so a page reload / dropped websocket / second tab re-attaches
+# to the running job instead of silently starting a second browser and
+# OOM-killing both.
+@st.cache_resource(show_spinner=False)
+def _job_registry() -> dict:
+    return {"job": None}
+
+
+def current_job() -> ScrapeJob | None:
+    return _job_registry()["job"]
+
+
+def set_job(job: ScrapeJob | None) -> None:
+    _job_registry()["job"] = job
 
 
 # --------------------------------------------------------------------------- #
@@ -961,6 +1175,9 @@ except Exception as exc:  # noqa: BLE001
     st.code(str(exc))
     st.stop()
 
+job = current_job()
+running = job is not None and job.running
+
 with st.sidebar:
     st.header("⚙️ الإعدادات")
     if ON_CLOUD:
@@ -973,7 +1190,8 @@ with st.sidebar:
     retries = st.slider("عدد إعادة المحاولة عند انتهاء المهلة", 0, 3, 1)
     restart_every = st.slider("إعادة تشغيل المتصفح كل N صف (لتوفير الذاكرة)", 10, 200,
                               20 if ON_CLOUD else 40, 10)
-    skip_filled = st.checkbox("تخطي الخلايا المعبأة مسبقاً", value=True)
+    skip_filled = st.checkbox("تخطي الخلايا المعبأة مسبقاً", value=True,
+                              help="لاستكمال ملف سبق تحميله جزئياً: ارفع ملف النتائج وسيُكمل من حيث توقف.")
     st.markdown("---")
     st.markdown("**الخدمات:**")
     do_moi = st.checkbox("الداخلية - غرامات الإقامة", value=True)
@@ -981,10 +1199,15 @@ with st.sidebar:
     do_renew = st.checkbox("PACI - تجديد البطاقة", value=True)
     with st.expander("معلومات النظام"):
         st.code(f"python {platform.python_version()} / {platform.system()}\n{boot_msg.splitlines()[0]}")
+        if job is not None:
+            st.code(
+                f"بدأ: {job.started_at:%H:%M:%S}\n"
+                f"إعادة تشغيل المتصفح: {job.scraper.relaunches if job.scraper else '-'}\n"
+                f"تدخلات المراقب: {job.watchdog_kills}\n"
+                f"فترات تهدئة: {job.cooldowns}"
+            )
 
 ss = st.session_state
-ss.setdefault("job", None)
-ss.setdefault("result_df", None)
 ss.setdefault("input_df", None)
 ss.setdefault("input_name", None)
 
@@ -1006,20 +1229,21 @@ if uploaded is not None and uploaded.name != ss.input_name:
     for c in (COL_MOI, COL_RENEW, COL_STATUS):
         df_in[c] = df_in[c].astype("object")
     df_in[COL_CID] = df_in[COL_CID].apply(normalize_civil_id)
-    ss.input_df, ss.input_name, ss.result_df = df_in, uploaded.name, None
+    ss.input_df, ss.input_name = df_in, uploaded.name
 
-job: ScrapeJob | None = ss.job
-running = job is not None and not job.done.is_set()
+if running:
+    st.info(f"⏳ يوجد استعلام قيد التنفيذ منذ {job.started_at:%H:%M:%S} — "
+            "يمكنك إغلاق الصفحة والعودة لاحقاً؛ التقدم محفوظ على الخادم.")
 
 if ss.input_df is not None:
     df = ss.input_df
     st.subheader("📋 معاينة الملف")
-    st.dataframe(df, use_container_width=True, height=240)
+    st.dataframe(df, width="stretch", height=240)
     st.info(f"عدد الصفوف: {len(df)}  —  أرقام مدنية صالحة (12 رقم): {(df[COL_CID].str.len() == 12).sum()}")
 
     c1, c2 = st.columns(2)
-    start_clicked = c1.button("🚀 بدء الاستعلام", type="primary", use_container_width=True, disabled=running)
-    stop_clicked = c2.button("⏹ إيقاف", use_container_width=True, disabled=not running)
+    start_clicked = c1.button("🚀 بدء الاستعلام", type="primary", width="stretch", disabled=running)
+    stop_clicked = c2.button("⏹ إيقاف", width="stretch", disabled=not running)
 
     if stop_clicked and job is not None:
         job.stop_event.set()
@@ -1031,46 +1255,86 @@ if ss.input_df is not None:
                  restart_every=restart_every, skip_filled=skip_filled,
                  do_moi=do_moi, do_status=do_status, do_renew=do_renew),
         )
+        set_job(job)
         job.start()
-        ss.job = job
         running = True
+elif job is None:
+    st.stop()
 
-# ---- live progress (polls the worker; safe across reruns) ----------------- #
-if job is not None:
-    progress = st.progress(0.0)
-    status_box = st.empty()
-    table_box = st.empty()
-    log_box = st.expander("سجل التنفيذ", expanded=False).empty()
+if job is not None and ss.input_df is None:
+    # Re-attached after a reload: still offer stop.
+    if st.button("⏹ إيقاف", width="stretch", disabled=not running):
+        job.stop_event.set()
 
-    def render():
-        pct = job.processed / job.total if job.total else 1.0
-        progress.progress(min(pct, 1.0), text=f"الصف {job.processed} من {job.total} — {job.current}")
-        table_box.dataframe(job.snapshot(), use_container_width=True, height=320)
-        with job.lock:
-            log_box.code("\n".join(job.logs[-200:]) or "…", language="text")
 
-    while not job.done.is_set():
-        status_box.info(f"🔎 جاري الاستعلام… {job.current}")
-        render()
-        time.sleep(1.0)
+# ---- live progress ------------------------------------------------------- #
+PREVIEW_ROWS = 40
 
-    render()
-    ss.result_df = job.snapshot()
-    if job.error:
-        status_box.error(f"توقف التنفيذ بسبب خطأ: {job.error}")
-    elif job.stop_event.is_set():
-        status_box.warning("تم إيقاف التنفيذ. يمكنك تحميل النتائج الجزئية أدناه.")
+
+def render_job(j: ScrapeJob) -> None:
+    pct = j.processed / j.total if j.total else 1.0
+    st.progress(min(pct, 1.0), text=f"الصف {j.processed} من {j.total} — {j.current}")
+    if j.running:
+        elapsed = (datetime.now() - j.started_at).total_seconds()
+        per_row = elapsed / j.processed if j.processed else 0.0
+        eta = per_row * (j.total - j.processed)
+        st.info(f"🔎 جاري الاستعلام… {j.current}  —  ~{per_row:.0f} ث/صف  —  "
+                f"الوقت المتبقي التقريبي: {eta / 60:.0f} دقيقة")
+    elif j.error:
+        st.error(f"توقف التنفيذ بسبب خطأ: {j.error}")
+    elif j.stop_event.is_set():
+        st.warning("تم إيقاف التنفيذ. يمكنك تحميل النتائج الجزئية أدناه.")
     else:
-        status_box.success("انتهى الاستعلام لجميع الصفوف ✅")
+        st.success("انتهى الاستعلام لجميع الصفوف ✅")
 
-# ---- download ------------------------------------------------------------- #
-if ss.result_df is not None:
-    st.subheader("⬇️ تحميل النتائج")
+    snap = j.snapshot()
+    if j.running and j.total > PREVIEW_ROWS:
+        # Only ship a window around the current row every tick: sending all
+        # 735 rows over the websocket every second is what made the UI crawl.
+        lo = max(0, j.processed - PREVIEW_ROWS + 5)
+        st.caption(f"عرض الصفوف {lo + 1}–{min(lo + PREVIEW_ROWS, j.total)} (النتائج الكاملة في ملف التحميل)")
+        st.dataframe(snap.iloc[lo:lo + PREVIEW_ROWS], width="stretch", height=320)
+    else:
+        st.dataframe(snap, width="stretch", height=320)
+
+    with st.expander("سجل التنفيذ", expanded=False):
+        with j.lock:
+            text = "\n".join(j.logs[-200:])
+        st.code(text or "…", language="text")
+
     st.download_button(
-        "📥 تحميل ملف Excel المحدث",
-        data=to_excel_bytes(ss.result_df),
+        "📥 تحميل ملف Excel " + ("(النتائج الجزئية حتى الآن)" if j.running else "المحدث"),
+        data=j.excel_bytes(),
         file_name=f"results_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
-        use_container_width=True,
+        width="stretch",
+        key=f"dl_{j.processed}_{j.running}",
     )
+
+
+if job is not None:
+    if hasattr(st, "fragment"):
+        # Non-blocking: the script run finishes immediately and only this block
+        # re-executes every 2 s. Streamlit stays responsive (stop button,
+        # reconnects) and nothing is held open for the hours a 735-row run takes.
+        was_running = running
+
+        @st.fragment(run_every=2.0 if was_running else None)
+        def _progress():
+            j = current_job()
+            if j is None:
+                return
+            render_job(j)
+            if was_running and not j.running:
+                st.rerun(scope="app")  # switch to the final (static) view
+
+        _progress()
+    else:  # very old Streamlit: blocking poll, but cheap
+        box = st.empty()
+        while job.running:
+            with box.container():
+                render_job(job)
+            time.sleep(2.0)
+        with box.container():
+            render_job(job)

@@ -22,3 +22,10 @@ Only the first column needs values; the other three are filled by the app.
   "حدث خطأ" / timeout results, turn Headless off in the sidebar and/or raise
   the delay between requests.
 - Selectors are documented at the top of `app.py` in case the sites change.
+- Long runs (hundreds of rows) keep going on the server even if you close the
+  tab: reopening the app re-attaches to the running job, shows progress and
+  offers a partial download at any time. Only one job runs per container.
+- If a site stops answering, the app pauses with back-off after 5 consecutive
+  failed rows and gives up after 40 with a clear message. Download the partial
+  results, then re-upload them later with "تخطي الخلايا المعبأة" enabled to
+  continue from where it stopped.

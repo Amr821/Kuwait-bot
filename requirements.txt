@@ -1,4 +1,4 @@
-streamlit>=1.40,<2
+streamlit>=1.50,<2   # st.fragment(run_every), st.rerun(scope), width="stretch"
 pandas>=2.2.3,<3
 openpyxl>=3.1.5,<4
 # Cloud defaults to Python 3.14. playwright 1.49.x hard-pins greenlet==3.1.1,
