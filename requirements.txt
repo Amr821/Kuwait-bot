@@ -1,4 +1,6 @@
-streamlit>=1.36
-pandas>=2.0
-openpyxl>=3.1
-playwright>=1.45
+streamlit>=1.40,<2
+pandas>=2.2.3,<3
+openpyxl>=3.1.5,<4
+# Pin Playwright: newer releases need apt libs Streamlit Cloud's Debian
+# (Bullseye) does not ship. 1.49.x is the last line known to launch cleanly.
+playwright==1.49.1
