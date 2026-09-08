@@ -4,11 +4,12 @@ Streamlit app: bulk lookup of Kuwait MOI residence fines and PACI card status /
 card renewal for a list of Civil IDs supplied in an Excel file.
 
 Hardened for Streamlit Community Cloud (Debian container, no root, ~1 GB RAM):
-  * OS shared libraries for Chromium come from packages.txt (apt at build).
-    That list matches Playwright 1.62's debian13-x64 chromium deps (t64 names).
-  * On first start, `ensure_chromium()` best-effort runs `playwright install-deps`
-    (needs root — usually a no-op on Cloud), then `playwright install chromium`,
-    then verifies a real headless launch. Cached via `@st.cache_resource`.
+  * Do NOT use packages.txt — Cloud's apt hits an expired bullseye-security
+    Release file and aborts the whole deploy whenever packages.txt exists.
+  * Instead, on Linux, `ensure_chromium()` vendors Playwright's Chromium
+    shared libs by downloading Debian .debs into ~/.cache/pw-syslibs and
+    setting LD_LIBRARY_PATH (no root). Then it runs
+    `playwright install chromium` and verifies a real headless launch.
   * Playwright is pinned in requirements.txt for Python 3.14 wheels.
   * Chromium uses --no-sandbox / --disable-dev-shm-usage; images/media/fonts
     are blocked; the browser is recycled every N rows to keep memory flat.
@@ -97,8 +98,8 @@ CHROMIUM_ARGS = [
 ]
 BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
 
-# Playwright 1.62 debian13-x64 chromium shared libs (same set as packages.txt).
-# Used for diagnostics + optional runtime vendoring if apt did not run.
+# Playwright 1.62 debian13-x64 chromium shared libs. Installed at runtime by
+# downloading .debs (packages.txt is intentionally absent — Cloud apt breaks).
 _CHROMIUM_APT_PACKAGES = (
     "libasound2t64",
     "libatk-bridge2.0-0t64",
@@ -122,6 +123,15 @@ _CHROMIUM_APT_PACKAGES = (
     "libxkbcommon0",
     "libxrandr2",
 )
+# Fallbacks if the host is older than trixie (no t64 package names).
+_CHROMIUM_APT_FALLBACKS = {
+    "libasound2t64": "libasound2",
+    "libatk-bridge2.0-0t64": "libatk-bridge2.0-0",
+    "libatk1.0-0t64": "libatk1.0-0",
+    "libatspi2.0-0t64": "libatspi2.0-0",
+    "libcups2t64": "libcups2",
+    "libglib2.0-0t64": "libglib2.0-0",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -152,10 +162,7 @@ def _run(cmd: list[str], timeout: int = 600) -> tuple[int, str]:
 
 
 def _try_install_system_deps() -> str:
-    """Best-effort OS deps. packages.txt is the real path on Streamlit Cloud.
-
-    `playwright install-deps` needs root; without sudo it is a silent no-op.
-    """
+    """Best-effort `playwright install-deps` (needs root — usually no-op on Cloud)."""
     lines = []
     attempts = (
         [sys.executable, "-m", "playwright", "install-deps", "chromium"],
@@ -175,11 +182,57 @@ def _try_install_system_deps() -> str:
     return "\n".join(lines) or "install-deps skipped (no root / unavailable)"
 
 
+def _resolve_deb_url(pkg: str, suite: str = "trixie") -> str | None:
+    """Return a direct .deb URL for `pkg` from packages.debian.org, or None."""
+    import urllib.request
+    from html.parser import HTMLParser
+
+    class _HrefParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.hrefs: list[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag != "a":
+                return
+            href = dict(attrs).get("href")
+            if href and ".deb" in href:
+                self.hrefs.append(href)
+
+    page = f"https://packages.debian.org/{suite}/amd64/{pkg}/download"
+    try:
+        html = urllib.request.urlopen(page, timeout=60).read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    parser = _HrefParser()
+    parser.feed(html)
+    hrefs = []
+    for h in parser.hrefs:
+        if h.startswith("//"):
+            h = "https:" + h
+        if h.startswith("http") and h.endswith(".deb"):
+            hrefs.append(h)
+    preferred = [h for h in hrefs if "debian.org" in h]
+    return (preferred or hrefs or [None])[0]
+
+
+def _extract_deb(deb_path: Path, root: Path) -> bool:
+    code, _ = _run(["dpkg-deb", "-x", str(deb_path), str(root)], timeout=120)
+    if code == 0:
+        return True
+    code2, _ = _run(
+        ["bash", "-lc", f"cd {deb_path.parent} && ar x {deb_path.name} && "
+         f"tar -xf data.tar.* -C {root}"],
+        timeout=120,
+    )
+    return code2 == 0
+
+
 def _vendor_syslibs_from_debs() -> str:
     """Download Chromium .debs from Debian and extract into a user-writable tree.
 
-    Used when packages.txt apt install failed (e.g. expired mirror metadata) but
-    the app still needs libnss3 / libatk / … at launch. No root required.
+    Streamlit Cloud cannot use packages.txt right now (apt update fails on an
+    expired bullseye-security Release file). Vendoring .debs needs no root.
     """
     if not IS_LINUX:
         return "syslib vendor skipped (not Linux)"
@@ -187,80 +240,45 @@ def _vendor_syslibs_from_debs() -> str:
     root = Path.home() / ".cache" / "pw-syslibs"
     lib_dir = root / "usr" / "lib" / "x86_64-linux-gnu"
     marker = root / ".ok"
-    if marker.exists() and lib_dir.exists():
+    if marker.exists() and (lib_dir.exists() or (root / "lib" / "x86_64-linux-gnu").exists()):
         _prepend_ld_path(root)
-        return f"syslibs ready: {lib_dir}"
+        return f"syslibs ready: {root}"
 
     root.mkdir(parents=True, exist_ok=True)
     deb_dir = root / "debs"
     deb_dir.mkdir(exist_ok=True)
-    log = []
+    log: list[str] = []
 
     try:
         import urllib.request
-        from html.parser import HTMLParser
-
-        class _HrefParser(HTMLParser):
-            def __init__(self):
-                super().__init__()
-                self.hrefs: list[str] = []
-
-            def handle_starttag(self, tag, attrs):
-                if tag != "a":
-                    return
-                href = dict(attrs).get("href")
-                if href and href.endswith(".deb"):
-                    self.hrefs.append(href)
 
         for pkg in _CHROMIUM_APT_PACKAGES:
-            page = f"https://packages.debian.org/trixie/amd64/{pkg}/download"
-            try:
-                html = urllib.request.urlopen(page, timeout=60).read().decode("utf-8", "replace")
-            except Exception as exc:  # noqa: BLE001
-                log.append(f"{pkg}: page fetch failed: {exc}")
+            deb_url = _resolve_deb_url(pkg, "trixie") or _resolve_deb_url(pkg, "bookworm")
+            used = pkg
+            if deb_url is None and pkg in _CHROMIUM_APT_FALLBACKS:
+                alt = _CHROMIUM_APT_FALLBACKS[pkg]
+                deb_url = _resolve_deb_url(alt, "bookworm") or _resolve_deb_url(alt, "trixie")
+                used = alt
+            if deb_url is None:
+                log.append(f"{pkg}: no .deb URL")
                 continue
-            parser = _HrefParser()
-            parser.feed(html)
-            # Prefer deb.debian.org / *.debian.org mirrors
-            candidates = [
-                h for h in parser.hrefs
-                if h.startswith("http") and "debian.org" in h and h.endswith(".deb")
-            ] or [h for h in parser.hrefs if h.startswith("http") and h.endswith(".deb")]
-            if not candidates:
-                log.append(f"{pkg}: no .deb link on download page")
-                continue
-            deb_url = candidates[0]
-            deb_path = deb_dir / f"{pkg}.deb"
+            deb_path = deb_dir / f"{used}.deb"
             try:
                 urllib.request.urlretrieve(deb_url, deb_path)
             except Exception as exc:  # noqa: BLE001
-                log.append(f"{pkg}: download failed: {exc}")
+                log.append(f"{used}: download failed: {exc}")
                 continue
-            # dpkg-deb is present on Streamlit Cloud images
-            code, out = _run(["dpkg-deb", "-x", str(deb_path), str(root)], timeout=120)
-            if code != 0:
-                # Fallback: ar + tar (no dpkg-deb)
-                code2, out2 = _run(
-                    ["bash", "-lc", f"cd {deb_dir!s} && ar x {deb_path.name} && "
-                     f"tar -xf data.tar.* -C {root}"],
-                    timeout=120,
-                )
-                if code2 != 0:
-                    log.append(f"{pkg}: extract failed\n{out}\n{out2}")
-                    continue
-            log.append(f"{pkg}: ok")
+            if not _extract_deb(deb_path, root):
+                log.append(f"{used}: extract failed")
+                continue
+            log.append(f"{used}: ok")
 
-        if not lib_dir.exists():
-            # Some packages put libs under /lib/x86_64-linux-gnu
-            alt = root / "lib" / "x86_64-linux-gnu"
-            if alt.exists():
-                lib_dir = alt
-            else:
-                return "syslib vendor failed — no lib dir\n" + "\n".join(log)
+        if not lib_dir.exists() and not (root / "lib" / "x86_64-linux-gnu").exists():
+            return "syslib vendor failed — no lib dir\n" + "\n".join(log)
 
         _prepend_ld_path(root)
         marker.write_text("ok\n", encoding="utf-8")
-        return f"syslibs vendored -> {lib_dir}\n" + "\n".join(log)
+        return f"syslibs vendored -> {root}\n" + "\n".join(log)
     except Exception as exc:  # noqa: BLE001
         return f"syslib vendor error: {exc}\n" + "\n".join(log)
 
@@ -334,37 +352,44 @@ def _install_chromium() -> str:
 
 @st.cache_resource(show_spinner=False)
 def ensure_chromium() -> str:
-    """Install system libs (best-effort) + Chromium; verify headless launch."""
+    """Vendor syslibs (Linux) + install Chromium; verify headless launch."""
     notes: list[str] = []
 
-    # If a previous vendor pass left libs on disk, wire LD_LIBRARY_PATH first.
-    vendor_root = Path.home() / ".cache" / "pw-syslibs"
-    if (vendor_root / ".ok").exists():
-        _prepend_ld_path(vendor_root)
-        notes.append(f"reused vendored syslibs at {vendor_root}")
+    # On Streamlit Cloud / Linux, pull shared libs BEFORE the first launch try.
+    # packages.txt is deliberately not used (Cloud apt currently hard-fails).
+    if IS_LINUX:
+        notes.append(_vendor_syslibs_from_debs())
+    else:
+        vendor_root = Path.home() / ".cache" / "pw-syslibs"
+        if (vendor_root / ".ok").exists():
+            _prepend_ld_path(vendor_root)
+
+    notes.append(_try_install_system_deps())
 
     exe = _chromium_works()
     if exe:
         return f"Chromium ready: {exe}\n" + "\n".join(notes)
 
-    notes.append(_try_install_system_deps())
     notes.append(_install_chromium())
-
     exe = _chromium_works()
     if exe:
         return f"Chromium installed: {exe}\n" + "\n".join(notes)
 
-    # packages.txt may have failed (expired apt metadata). Vendor .debs ourselves.
-    notes.append(_vendor_syslibs_from_debs())
-    exe = _chromium_works()
-    if exe:
-        return f"Chromium ready after syslib vendor: {exe}\n" + "\n".join(notes)
+    # Retry vendor once more in case the first pass was partial.
+    if IS_LINUX:
+        marker = Path.home() / ".cache" / "pw-syslibs" / ".ok"
+        if marker.exists():
+            marker.unlink(missing_ok=True)
+        notes.append(_vendor_syslibs_from_debs())
+        exe = _chromium_works()
+        if exe:
+            return f"Chromium ready after syslib vendor: {exe}\n" + "\n".join(notes)
 
     launch_err = _last_launch_error()
     raise RuntimeError(
         "Chromium downloaded but headless launch failed (usually missing "
-        "shared libraries like libnss3 / libatk). Ensure packages.txt is "
-        "present at the repo root (Debian 13 / t64 names) and reboot the app.\n"
+        "shared libraries like libnss3 / libatk). Syslib vendoring from "
+        "Debian .debs should supply them without packages.txt.\n"
         f"Launch error: {launch_err}\n" + "\n".join(notes)
     )
 
@@ -687,7 +712,7 @@ try:
     with st.spinner("جاري تجهيز المتصفح (يحدث مرة واحدة عند أول تشغيل)…"):
         boot_msg = ensure_chromium()
 except Exception as exc:  # noqa: BLE001
-    st.error("تعذر تثبيت/تشغيل Chromium. راجع packages.txt و requirements.txt.")
+    st.error("تعذر تثبيت/تشغيل Chromium. راجع سجل الخطأ أدناه و requirements.txt.")
     st.code(str(exc))
     st.stop()
 
