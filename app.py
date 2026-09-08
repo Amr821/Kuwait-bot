@@ -4,14 +4,12 @@ Streamlit app: bulk lookup of Kuwait MOI residence fines and PACI card status /
 card renewal for a list of Civil IDs supplied in an Excel file.
 
 Hardened for Streamlit Community Cloud (Debian container, no root, ~1 GB RAM):
-  * On first start, `ensure_chromium()` runs `python -m playwright install
-    chromium`, then verifies launch with container-safe flags. Result is
-    cached for the life of the process via `@st.cache_resource`.
-  * No packages.txt / apt install-deps — Streamlit Cloud's base image plus
-    the pinned Playwright build must be enough (no root).
-  * Playwright is pinned in requirements.txt to a build with Python 3.14
-    wheels (Cloud's current default). Prefer Python 3.12 in Cloud Advanced
-    settings when available.
+  * OS shared libraries for Chromium come from packages.txt (apt at build).
+    That list matches Playwright 1.62's debian13-x64 chromium deps (t64 names).
+  * On first start, `ensure_chromium()` best-effort runs `playwright install-deps`
+    (needs root — usually a no-op on Cloud), then `playwright install chromium`,
+    then verifies a real headless launch. Cached via `@st.cache_resource`.
+  * Playwright is pinned in requirements.txt for Python 3.14 wheels.
   * Chromium uses --no-sandbox / --disable-dev-shm-usage; images/media/fonts
     are blocked; the browser is recycled every N rows to keep memory flat.
   * All Playwright work runs in a dedicated worker thread (avoids the
@@ -91,13 +89,39 @@ CHROMIUM_ARGS = [
     "--disable-background-networking",
     "--disable-background-timer-throttling",
     "--disable-renderer-backgrounding",
-    "--disable-features=TranslateUI,AudioServiceOutOfProcess",
+    "--disable-features=TranslateUI,AudioServiceOutOfProcess,VizDisplayCompositor",
     "--mute-audio",
     "--renderer-process-limit=2",
     "--disable-blink-features=AutomationControlled",
     "--lang=ar-KW,ar",
 ]
 BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+
+# Playwright 1.62 debian13-x64 chromium shared libs (same set as packages.txt).
+# Used for diagnostics + optional runtime vendoring if apt did not run.
+_CHROMIUM_APT_PACKAGES = (
+    "libasound2t64",
+    "libatk-bridge2.0-0t64",
+    "libatk1.0-0t64",
+    "libatspi2.0-0t64",
+    "libcairo2",
+    "libcups2t64",
+    "libdbus-1-3",
+    "libdrm2",
+    "libgbm1",
+    "libglib2.0-0t64",
+    "libnspr4",
+    "libnss3",
+    "libpango-1.0-0",
+    "libx11-6",
+    "libxcb1",
+    "libxcomposite1",
+    "libxdamage1",
+    "libxext6",
+    "libxfixes3",
+    "libxkbcommon0",
+    "libxrandr2",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -121,6 +145,141 @@ def _in_thread(fn):
     return box.get("v")
 
 
+def _run(cmd: list[str], timeout: int = 600) -> tuple[int, str]:
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    out = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    return proc.returncode, out[-3000:]
+
+
+def _try_install_system_deps() -> str:
+    """Best-effort OS deps. packages.txt is the real path on Streamlit Cloud.
+
+    `playwright install-deps` needs root; without sudo it is a silent no-op.
+    """
+    lines = []
+    attempts = (
+        [sys.executable, "-m", "playwright", "install-deps", "chromium"],
+        ["sudo", "-n", sys.executable, "-m", "playwright", "install-deps", "chromium"],
+    )
+    for cmd in attempts:
+        try:
+            code, out = _run(cmd, timeout=300)
+        except FileNotFoundError:
+            continue
+        except subprocess.TimeoutExpired:
+            lines.append(f"$ {' '.join(cmd[2:])} -> TIMEOUT")
+            continue
+        lines.append(f"$ {' '.join(cmd)} -> exit {code}\n{out}")
+        if code == 0:
+            break
+    return "\n".join(lines) or "install-deps skipped (no root / unavailable)"
+
+
+def _vendor_syslibs_from_debs() -> str:
+    """Download Chromium .debs from Debian and extract into a user-writable tree.
+
+    Used when packages.txt apt install failed (e.g. expired mirror metadata) but
+    the app still needs libnss3 / libatk / … at launch. No root required.
+    """
+    if not IS_LINUX:
+        return "syslib vendor skipped (not Linux)"
+
+    root = Path.home() / ".cache" / "pw-syslibs"
+    lib_dir = root / "usr" / "lib" / "x86_64-linux-gnu"
+    marker = root / ".ok"
+    if marker.exists() and lib_dir.exists():
+        _prepend_ld_path(root)
+        return f"syslibs ready: {lib_dir}"
+
+    root.mkdir(parents=True, exist_ok=True)
+    deb_dir = root / "debs"
+    deb_dir.mkdir(exist_ok=True)
+    log = []
+
+    try:
+        import urllib.request
+        from html.parser import HTMLParser
+
+        class _HrefParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.hrefs: list[str] = []
+
+            def handle_starttag(self, tag, attrs):
+                if tag != "a":
+                    return
+                href = dict(attrs).get("href")
+                if href and href.endswith(".deb"):
+                    self.hrefs.append(href)
+
+        for pkg in _CHROMIUM_APT_PACKAGES:
+            page = f"https://packages.debian.org/trixie/amd64/{pkg}/download"
+            try:
+                html = urllib.request.urlopen(page, timeout=60).read().decode("utf-8", "replace")
+            except Exception as exc:  # noqa: BLE001
+                log.append(f"{pkg}: page fetch failed: {exc}")
+                continue
+            parser = _HrefParser()
+            parser.feed(html)
+            # Prefer deb.debian.org / *.debian.org mirrors
+            candidates = [
+                h for h in parser.hrefs
+                if h.startswith("http") and "debian.org" in h and h.endswith(".deb")
+            ] or [h for h in parser.hrefs if h.startswith("http") and h.endswith(".deb")]
+            if not candidates:
+                log.append(f"{pkg}: no .deb link on download page")
+                continue
+            deb_url = candidates[0]
+            deb_path = deb_dir / f"{pkg}.deb"
+            try:
+                urllib.request.urlretrieve(deb_url, deb_path)
+            except Exception as exc:  # noqa: BLE001
+                log.append(f"{pkg}: download failed: {exc}")
+                continue
+            # dpkg-deb is present on Streamlit Cloud images
+            code, out = _run(["dpkg-deb", "-x", str(deb_path), str(root)], timeout=120)
+            if code != 0:
+                # Fallback: ar + tar (no dpkg-deb)
+                code2, out2 = _run(
+                    ["bash", "-lc", f"cd {deb_dir!s} && ar x {deb_path.name} && "
+                     f"tar -xf data.tar.* -C {root}"],
+                    timeout=120,
+                )
+                if code2 != 0:
+                    log.append(f"{pkg}: extract failed\n{out}\n{out2}")
+                    continue
+            log.append(f"{pkg}: ok")
+
+        if not lib_dir.exists():
+            # Some packages put libs under /lib/x86_64-linux-gnu
+            alt = root / "lib" / "x86_64-linux-gnu"
+            if alt.exists():
+                lib_dir = alt
+            else:
+                return "syslib vendor failed — no lib dir\n" + "\n".join(log)
+
+        _prepend_ld_path(root)
+        marker.write_text("ok\n", encoding="utf-8")
+        return f"syslibs vendored -> {lib_dir}\n" + "\n".join(log)
+    except Exception as exc:  # noqa: BLE001
+        return f"syslib vendor error: {exc}\n" + "\n".join(log)
+
+
+def _prepend_ld_path(root: Path) -> None:
+    candidates = [
+        root / "usr" / "lib" / "x86_64-linux-gnu",
+        root / "lib" / "x86_64-linux-gnu",
+        root / "usr" / "lib",
+        root / "lib",
+    ]
+    existing = [str(p) for p in candidates if p.is_dir()]
+    if not existing:
+        return
+    cur = os.environ.get("LD_LIBRARY_PATH", "")
+    parts = existing + ([cur] if cur else [])
+    os.environ["LD_LIBRARY_PATH"] = ":".join(parts)
+
+
 def _launch_probe() -> str:
     """Start Chromium briefly; return its executable path on success.
 
@@ -131,7 +290,11 @@ def _launch_probe() -> str:
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=CHROMIUM_ARGS)
+        browser = p.chromium.launch(
+            headless=True,
+            args=CHROMIUM_ARGS,
+            chromium_sandbox=False,
+        )
         try:
             page = browser.new_page()
             page.set_content("<html><body>ok</body></html>")
@@ -148,37 +311,61 @@ def _chromium_works() -> str | None:
         return None
 
 
+def _last_launch_error() -> str:
+    try:
+        _in_thread(_launch_probe)
+        return ""
+    except Exception as exc:  # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}"
+
+
 def _install_chromium() -> str:
-    """Download Chromium binaries only (no apt / install-deps)."""
+    """Download Chromium browser binaries into PLAYWRIGHT_BROWSERS_PATH."""
     cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    out = (proc.stdout or "")[-2000:]
-    err = (proc.stderr or "")[-2000:]
-    summary = f"$ {' '.join(cmd[2:])}\n{out}\n{err}".strip()
-    if proc.returncode != 0:
+    code, out = _run(cmd, timeout=600)
+    summary = f"$ {' '.join(cmd[2:])}\n{out}".strip()
+    if code != 0:
         raise RuntimeError(
             "playwright install chromium failed "
-            f"(exit {proc.returncode}):\n{summary}"
+            f"(exit {code}):\n{summary}"
         )
     return summary
 
 
 @st.cache_resource(show_spinner=False)
 def ensure_chromium() -> str:
-    """Install + verify Chromium once; cached for the life of the process."""
+    """Install system libs (best-effort) + Chromium; verify headless launch."""
+    notes: list[str] = []
+
+    # If a previous vendor pass left libs on disk, wire LD_LIBRARY_PATH first.
+    vendor_root = Path.home() / ".cache" / "pw-syslibs"
+    if (vendor_root / ".ok").exists():
+        _prepend_ld_path(vendor_root)
+        notes.append(f"reused vendored syslibs at {vendor_root}")
+
     exe = _chromium_works()
     if exe:
-        return f"Chromium ready: {exe}"
+        return f"Chromium ready: {exe}\n" + "\n".join(notes)
 
-    install_log = _install_chromium()
+    notes.append(_try_install_system_deps())
+    notes.append(_install_chromium())
+
     exe = _chromium_works()
     if exe:
-        return f"Chromium installed: {exe}\n{install_log}"
+        return f"Chromium installed: {exe}\n" + "\n".join(notes)
 
+    # packages.txt may have failed (expired apt metadata). Vendor .debs ourselves.
+    notes.append(_vendor_syslibs_from_debs())
+    exe = _chromium_works()
+    if exe:
+        return f"Chromium ready after syslib vendor: {exe}\n" + "\n".join(notes)
+
+    launch_err = _last_launch_error()
     raise RuntimeError(
-        "Chromium was downloaded but could not launch. "
-        "Confirm playwright is installed (see requirements.txt) and that "
-        f"Streamlit Cloud can run headless Chromium.\n{install_log}"
+        "Chromium downloaded but headless launch failed (usually missing "
+        "shared libraries like libnss3 / libatk). Ensure packages.txt is "
+        "present at the repo root (Debian 13 / t64 names) and reboot the app.\n"
+        f"Launch error: {launch_err}\n" + "\n".join(notes)
     )
 
 
@@ -222,7 +409,11 @@ class GovScraper:
 
         self.timeout_ms = timeout_s * 1000
         self._pw = sync_playwright().start()
-        self.browser = self._pw.chromium.launch(headless=headless, args=CHROMIUM_ARGS)
+        self.browser = self._pw.chromium.launch(
+            headless=headless,
+            args=CHROMIUM_ARGS,
+            chromium_sandbox=False,
+        )
         self.context = self.browser.new_context(
             locale="ar-KW",
             viewport={"width": 1280, "height": 800},
@@ -496,7 +687,7 @@ try:
     with st.spinner("جاري تجهيز المتصفح (يحدث مرة واحدة عند أول تشغيل)…"):
         boot_msg = ensure_chromium()
 except Exception as exc:  # noqa: BLE001
-    st.error("تعذر تثبيت Chromium. راجع requirements.txt (playwright).")
+    st.error("تعذر تثبيت/تشغيل Chromium. راجع packages.txt و requirements.txt.")
     st.code(str(exc))
     st.stop()
 
