@@ -7,8 +7,8 @@ Hardened for Streamlit Community Cloud (Debian container, no root, ~1 GB RAM):
   * On first start, `ensure_chromium()` runs `python -m playwright install
     chromium`, then verifies launch with container-safe flags. Result is
     cached for the life of the process via `@st.cache_resource`.
-  * OS shared libraries come from packages.txt (apt). We never call
-    `playwright install-deps` / `--with-deps` (needs root).
+  * No packages.txt / apt install-deps — Streamlit Cloud's base image plus
+    the pinned Playwright build must be enough (no root).
   * Playwright is pinned in requirements.txt to a Bullseye-compatible build.
   * Chromium uses --no-sandbox / --disable-dev-shm-usage; images/media/fonts
     are blocked; the browser is recycled every N rows to keep memory flat.
@@ -147,7 +147,7 @@ def _chromium_works() -> str | None:
 
 
 def _install_chromium() -> str:
-    """Download Chromium binaries (no apt — packages.txt owns system libs)."""
+    """Download Chromium binaries only (no apt / install-deps)."""
     cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     out = (proc.stdout or "")[-2000:]
@@ -175,8 +175,8 @@ def ensure_chromium() -> str:
 
     raise RuntimeError(
         "Chromium was downloaded but could not launch. "
-        "Check packages.txt for missing shared libraries "
-        f"(libnss3, libgbm1, libgtk-3-0, …).\n{install_log}"
+        "Confirm playwright==1.49.1 in requirements.txt and that "
+        f"Streamlit Cloud can run headless Chromium.\n{install_log}"
     )
 
 
@@ -494,7 +494,7 @@ try:
     with st.spinner("جاري تجهيز المتصفح (يحدث مرة واحدة عند أول تشغيل)…"):
         boot_msg = ensure_chromium()
 except Exception as exc:  # noqa: BLE001
-    st.error("تعذر تثبيت Chromium. راجع packages.txt / requirements.txt.")
+    st.error("تعذر تثبيت Chromium. راجع requirements.txt (playwright==1.49.1).")
     st.code(str(exc))
     st.stop()
 
