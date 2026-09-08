@@ -98,8 +98,8 @@ CHROMIUM_ARGS = [
 ]
 BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
 
-# Playwright 1.62 debian13-x64 chromium shared libs. Installed at runtime by
-# downloading .debs (packages.txt is intentionally absent — Cloud apt breaks).
+# Extra shared libs chrome-headless-shell needs beyond Playwright's minimal
+# debian13 chromium list (Cloud reported libXrender.so.1 missing).
 _CHROMIUM_APT_PACKAGES = (
     "libasound2t64",
     "libatk-bridge2.0-0t64",
@@ -115,14 +115,27 @@ _CHROMIUM_APT_PACKAGES = (
     "libnss3",
     "libpango-1.0-0",
     "libx11-6",
+    "libx11-xcb1",
     "libxcb1",
+    "libxcb-dri3-0",
     "libxcomposite1",
+    "libxcursor1",
     "libxdamage1",
     "libxext6",
     "libxfixes3",
+    "libxi6",
     "libxkbcommon0",
     "libxrandr2",
+    "libxrender1",
+    "libxtst6",
+    "libexpat1",
+    "libfontconfig1",
+    "libfreetype6",
+    "libharfbuzz0b",
+    "libpng16-16t64",
+    "zlib1g",
 )
+_SYSLIB_MARKER = ".ok.v3"  # bump to force re-vendor when the package set grows
 # Fallbacks if the host is older than trixie (no t64 package names).
 _CHROMIUM_APT_FALLBACKS = {
     "libasound2t64": "libasound2",
@@ -131,6 +144,48 @@ _CHROMIUM_APT_FALLBACKS = {
     "libatspi2.0-0t64": "libatspi2.0-0",
     "libcups2t64": "libcups2",
     "libglib2.0-0t64": "libglib2.0-0",
+    "libpng16-16t64": "libpng16-16",
+}
+# SONAME -> Debian package when the naive libfoo.so.N -> libfooN guess fails.
+_SO_TO_PKG = {
+    "libXrender.so.1": "libxrender1",
+    "libXi.so.6": "libxi6",
+    "libXcursor.so.1": "libxcursor1",
+    "libXtst.so.6": "libxtst6",
+    "libX11.so.6": "libx11-6",
+    "libX11-xcb.so.1": "libx11-xcb1",
+    "libXext.so.6": "libxext6",
+    "libXfixes.so.3": "libxfixes3",
+    "libXdamage.so.1": "libxdamage1",
+    "libXcomposite.so.1": "libxcomposite1",
+    "libXrandr.so.2": "libxrandr2",
+    "libxcb-dri3.so.0": "libxcb-dri3-0",
+    "libpng16.so.16": "libpng16-16t64",
+    "libharfbuzz.so.0": "libharfbuzz0b",
+    "libfreetype.so.6": "libfreetype6",
+    "libfontconfig.so.1": "libfontconfig1",
+    "libexpat.so.1": "libexpat1",
+    "libz.so.1": "zlib1g",
+    "libasound.so.2": "libasound2t64",
+    "libatk-1.0.so.0": "libatk1.0-0t64",
+    "libatk-bridge-2.0.so.0": "libatk-bridge2.0-0t64",
+    "libatspi.so.0": "libatspi2.0-0t64",
+    "libcups.so.2": "libcups2t64",
+    "libdbus-1.so.3": "libdbus-1-3",
+    "libdrm.so.2": "libdrm2",
+    "libgbm.so.1": "libgbm1",
+    "libglib-2.0.so.0": "libglib2.0-0t64",
+    "libgobject-2.0.so.0": "libglib2.0-0t64",
+    "libgio-2.0.so.0": "libglib2.0-0t64",
+    "libnspr4.so": "libnspr4",
+    "libnss3.so": "libnss3",
+    "libnssutil3.so": "libnss3",
+    "libsmime3.so": "libnss3",
+    "libssl3.so": "libnss3",
+    "libpango-1.0.so.0": "libpango-1.0-0",
+    "libpangocairo-1.0.so.0": "libpangocairo-1.0-0",
+    "libcairo.so.2": "libcairo2",
+    "libxkbcommon.so.0": "libxkbcommon0",
 }
 
 
@@ -228,7 +283,57 @@ def _extract_deb(deb_path: Path, root: Path) -> bool:
     return code2 == 0
 
 
-def _vendor_syslibs_from_debs() -> str:
+def _syslib_root() -> Path:
+    return Path.home() / ".cache" / "pw-syslibs"
+
+
+def _pkg_for_soname(soname: str) -> str | None:
+    if soname in _SO_TO_PKG:
+        return _SO_TO_PKG[soname]
+    m = re.match(r"(lib[A-Za-z0-9+._-]+)\.so(?:\.(\d+))?", soname)
+    if not m:
+        return None
+    base = m.group(1).lower().replace("_", "-")
+    maj = m.group(2)
+    return f"{base}{maj}" if maj else base
+
+
+def _missing_soname(err: str) -> str | None:
+    m = re.search(
+        r"error while loading shared libraries:\s*([^\s:]+):\s*cannot open shared object file",
+        err,
+    )
+    return m.group(1) if m else None
+
+
+def _download_and_extract_pkg(pkg: str, root: Path, log: list[str]) -> bool:
+    import urllib.request
+
+    deb_url = _resolve_deb_url(pkg, "trixie") or _resolve_deb_url(pkg, "bookworm")
+    used = pkg
+    if deb_url is None and pkg in _CHROMIUM_APT_FALLBACKS:
+        alt = _CHROMIUM_APT_FALLBACKS[pkg]
+        deb_url = _resolve_deb_url(alt, "bookworm") or _resolve_deb_url(alt, "trixie")
+        used = alt
+    if deb_url is None:
+        log.append(f"{pkg}: no .deb URL")
+        return False
+    deb_dir = root / "debs"
+    deb_dir.mkdir(parents=True, exist_ok=True)
+    deb_path = deb_dir / f"{used}.deb"
+    try:
+        urllib.request.urlretrieve(deb_url, deb_path)
+    except Exception as exc:  # noqa: BLE001
+        log.append(f"{used}: download failed: {exc}")
+        return False
+    if not _extract_deb(deb_path, root):
+        log.append(f"{used}: extract failed")
+        return False
+    log.append(f"{used}: ok")
+    return True
+
+
+def _vendor_syslibs_from_debs(extra_pkgs: tuple[str, ...] = ()) -> str:
     """Download Chromium .debs from Debian and extract into a user-writable tree.
 
     Streamlit Cloud cannot use packages.txt right now (apt update fails on an
@@ -237,50 +342,59 @@ def _vendor_syslibs_from_debs() -> str:
     if not IS_LINUX:
         return "syslib vendor skipped (not Linux)"
 
-    root = Path.home() / ".cache" / "pw-syslibs"
-    lib_dir = root / "usr" / "lib" / "x86_64-linux-gnu"
-    marker = root / ".ok"
-    if marker.exists() and (lib_dir.exists() or (root / "lib" / "x86_64-linux-gnu").exists()):
+    root = _syslib_root()
+    marker = root / _SYSLIB_MARKER
+    lib_ok = (root / "usr" / "lib" / "x86_64-linux-gnu").exists() or (
+        root / "lib" / "x86_64-linux-gnu"
+    ).exists()
+    pkgs = tuple(dict.fromkeys((*_CHROMIUM_APT_PACKAGES, *extra_pkgs)))
+
+    # Reuse cache only when marker matches current package-set generation and
+    # no extra packages were requested.
+    if marker.exists() and lib_ok and not extra_pkgs:
         _prepend_ld_path(root)
         return f"syslibs ready: {root}"
 
     root.mkdir(parents=True, exist_ok=True)
-    deb_dir = root / "debs"
-    deb_dir.mkdir(exist_ok=True)
     log: list[str] = []
 
     try:
-        import urllib.request
+        for pkg in pkgs:
+            # Skip if this exact .deb was already extracted in a prior pass.
+            if (root / "debs" / f"{pkg}.deb").exists() and lib_ok and extra_pkgs:
+                # Still extract again for safety when filling gaps.
+                pass
+            _download_and_extract_pkg(pkg, root, log)
 
-        for pkg in _CHROMIUM_APT_PACKAGES:
-            deb_url = _resolve_deb_url(pkg, "trixie") or _resolve_deb_url(pkg, "bookworm")
-            used = pkg
-            if deb_url is None and pkg in _CHROMIUM_APT_FALLBACKS:
-                alt = _CHROMIUM_APT_FALLBACKS[pkg]
-                deb_url = _resolve_deb_url(alt, "bookworm") or _resolve_deb_url(alt, "trixie")
-                used = alt
-            if deb_url is None:
-                log.append(f"{pkg}: no .deb URL")
-                continue
-            deb_path = deb_dir / f"{used}.deb"
-            try:
-                urllib.request.urlretrieve(deb_url, deb_path)
-            except Exception as exc:  # noqa: BLE001
-                log.append(f"{used}: download failed: {exc}")
-                continue
-            if not _extract_deb(deb_path, root):
-                log.append(f"{used}: extract failed")
-                continue
-            log.append(f"{used}: ok")
-
-        if not lib_dir.exists() and not (root / "lib" / "x86_64-linux-gnu").exists():
+        if not (root / "usr" / "lib" / "x86_64-linux-gnu").exists() and not (
+            root / "lib" / "x86_64-linux-gnu"
+        ).exists():
             return "syslib vendor failed — no lib dir\n" + "\n".join(log)
 
         _prepend_ld_path(root)
+        # Drop stale markers from older package sets.
+        for old in root.glob(".ok*"):
+            old.unlink(missing_ok=True)
         marker.write_text("ok\n", encoding="utf-8")
         return f"syslibs vendored -> {root}\n" + "\n".join(log)
     except Exception as exc:  # noqa: BLE001
         return f"syslib vendor error: {exc}\n" + "\n".join(log)
+
+
+def _fix_missing_so(err: str) -> str:
+    """Parse a missing .so from a launch error and vendor its Debian package."""
+    soname = _missing_soname(err)
+    if not soname:
+        return "no missing .so parsed from launch error"
+    pkg = _pkg_for_soname(soname)
+    if not pkg:
+        return f"unmapped soname: {soname}"
+    # Invalidate ready marker so the new package is merged in.
+    root = _syslib_root()
+    for old in root.glob(".ok*"):
+        old.unlink(missing_ok=True)
+    return _vendor_syslibs_from_debs(extra_pkgs=(pkg,))
+
 
 
 def _prepend_ld_path(root: Path) -> None:
@@ -360,36 +474,32 @@ def ensure_chromium() -> str:
     if IS_LINUX:
         notes.append(_vendor_syslibs_from_debs())
     else:
-        vendor_root = Path.home() / ".cache" / "pw-syslibs"
-        if (vendor_root / ".ok").exists():
-            _prepend_ld_path(vendor_root)
+        root = _syslib_root()
+        if any(root.glob(".ok*")):
+            _prepend_ld_path(root)
 
     notes.append(_try_install_system_deps())
 
-    exe = _chromium_works()
-    if exe:
-        return f"Chromium ready: {exe}\n" + "\n".join(notes)
+    if not _chromium_works():
+        notes.append(_install_chromium())
 
-    notes.append(_install_chromium())
-    exe = _chromium_works()
-    if exe:
-        return f"Chromium installed: {exe}\n" + "\n".join(notes)
-
-    # Retry vendor once more in case the first pass was partial.
-    if IS_LINUX:
-        marker = Path.home() / ".cache" / "pw-syslibs" / ".ok"
-        if marker.exists():
-            marker.unlink(missing_ok=True)
-        notes.append(_vendor_syslibs_from_debs())
+    # Iteratively vendor whatever .so the launcher still complains about
+    # (e.g. libXrender.so.1 → libxrender1).
+    for attempt in range(8):
         exe = _chromium_works()
         if exe:
-            return f"Chromium ready after syslib vendor: {exe}\n" + "\n".join(notes)
+            return f"Chromium ready: {exe}\n" + "\n".join(notes)
+        err = _last_launch_error()
+        if not IS_LINUX or not _missing_soname(err):
+            notes.append(f"launch still failing (attempt {attempt + 1}): {err}")
+            break
+        notes.append(_fix_missing_so(err))
 
     launch_err = _last_launch_error()
     raise RuntimeError(
         "Chromium downloaded but headless launch failed (usually missing "
-        "shared libraries like libnss3 / libatk). Syslib vendoring from "
-        "Debian .debs should supply them without packages.txt.\n"
+        "shared libraries). Syslib vendoring from Debian .debs should supply "
+        "them without packages.txt.\n"
         f"Launch error: {launch_err}\n" + "\n".join(notes)
     )
 
