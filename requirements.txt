@@ -1,6 +1,10 @@
 streamlit>=1.40,<2
 pandas>=2.2.3,<3
 openpyxl>=3.1.5,<4
-# Pin Playwright: newer releases need apt libs Streamlit Cloud's Debian
-# (Bullseye) does not ship. 1.49.x is the last line known to launch cleanly.
-playwright==1.49.1
+# Cloud defaults to Python 3.14. playwright 1.49.x hard-pins greenlet==3.1.1,
+# which has no cp314 wheel and fails to compile. 1.62.x already installed
+# cleanly on this app before the 1.49.1 pin.
+playwright==1.62.0
+greenlet>=3.2.4,<4
+# Streamlit Cloud replaces pyarrow 25 (segfault); keep us below that ourselves.
+pyarrow>=14,<25

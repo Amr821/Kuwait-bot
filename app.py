@@ -9,7 +9,9 @@ Hardened for Streamlit Community Cloud (Debian container, no root, ~1 GB RAM):
     cached for the life of the process via `@st.cache_resource`.
   * No packages.txt / apt install-deps — Streamlit Cloud's base image plus
     the pinned Playwright build must be enough (no root).
-  * Playwright is pinned in requirements.txt to a Bullseye-compatible build.
+  * Playwright is pinned in requirements.txt to a build with Python 3.14
+    wheels (Cloud's current default). Prefer Python 3.12 in Cloud Advanced
+    settings when available.
   * Chromium uses --no-sandbox / --disable-dev-shm-usage; images/media/fonts
     are blocked; the browser is recycled every N rows to keep memory flat.
   * All Playwright work runs in a dedicated worker thread (avoids the
@@ -175,7 +177,7 @@ def ensure_chromium() -> str:
 
     raise RuntimeError(
         "Chromium was downloaded but could not launch. "
-        "Confirm playwright==1.49.1 in requirements.txt and that "
+        "Confirm playwright is installed (see requirements.txt) and that "
         f"Streamlit Cloud can run headless Chromium.\n{install_log}"
     )
 
@@ -494,7 +496,7 @@ try:
     with st.spinner("جاري تجهيز المتصفح (يحدث مرة واحدة عند أول تشغيل)…"):
         boot_msg = ensure_chromium()
 except Exception as exc:  # noqa: BLE001
-    st.error("تعذر تثبيت Chromium. راجع requirements.txt (playwright==1.49.1).")
+    st.error("تعذر تثبيت Chromium. راجع requirements.txt (playwright).")
     st.code(str(exc))
     st.stop()
 
