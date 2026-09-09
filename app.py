@@ -1491,6 +1491,10 @@ T: dict[str, dict[str, str]] = {
         "app_title": "الاستعلام الآلي عن الغرامات والبطاقة المدنية",
         "app_subtitle": "غرامات الإقامة (وزارة الداخلية) • حالة البطاقة وتجديدها (الهيئة العامة للمعلومات المدنية)",
         "hero_badge": "معالجة دفعات Excel",
+        "brand": "الاستعلام الآلي",
+        "chip_moi": "غرامات الإقامة",
+        "chip_paci": "حالة وتجديد البطاقة",
+        "chip_batch": "معالجة على الخادم",
         "boot_spinner": "جاري تجهيز المتصفح (يحدث مرة واحدة عند أول تشغيل)…",
         "boot_error": "تعذر تثبيت/تشغيل Chromium. راجع سجل الخطأ أدناه و requirements.txt.",
         "settings": "الإعدادات",
@@ -1563,6 +1567,10 @@ T: dict[str, dict[str, str]] = {
         "app_title": "Automated Fines & Civil ID Card Lookup",
         "app_subtitle": "Residence fines (Ministry of Interior) • Card status and renewal (Public Authority for Civil Information)",
         "hero_badge": "Excel batch processing",
+        "brand": "Bulk Lookup",
+        "chip_moi": "Residence fines",
+        "chip_paci": "Card status & renewal",
+        "chip_batch": "Runs on the server",
         "boot_spinner": "Preparing the browser (one-time setup on first run)…",
         "boot_error": "Could not install/launch Chromium. See the error log below and requirements.txt.",
         "settings": "Settings",
@@ -1675,12 +1683,32 @@ html, body, .stApp, [data-testid="stSidebar"] {{
 /* Hide the default footer / decorations */
 footer {{ visibility: hidden; }}
 [data-testid="stDecoration"] {{ display: none; }}
-.block-container {{ padding-top: 4.4rem; padding-bottom: 3rem; max-width: 1200px; }}
+.block-container {{ padding-top: 3.6rem; padding-bottom: 3rem; max-width: 1180px; }}
+/* Consistent rhythm between stacked blocks */
+[data-testid="stVerticalBlock"] > div:has(> [data-testid="stVerticalBlockBorderWrapper"]) {{ margin-bottom: 4px; }}
+
+/* Sidebar */
+[data-testid="stSidebar"] {{
+  background: linear-gradient(180deg, rgba(15,118,110,.06), transparent 240px), var(--secondary-background-color);
+  border-{'left' if rtl else 'right'}: 1px solid rgba(128,128,128,.14);
+}}
+[data-testid="stSidebar"] .block-container, [data-testid="stSidebar"] > div:first-child {{ padding-top: 1.2rem; }}
+.kb-brand {{
+  display: flex; align-items: center; gap: 10px; margin: 2px 0 10px;
+}}
+.kb-brand .logo {{
+  width: 38px; height: 38px; border-radius: 12px; display: grid; place-items: center; font-size: 1.25rem;
+  background: linear-gradient(135deg, #0f766e, #1d4ed8); box-shadow: 0 8px 18px -10px rgba(29,78,216,.7);
+}}
+.kb-brand .name {{ font-weight: 800; font-size: 1.02rem; line-height: 1.1; }}
+.kb-brand .sub  {{ font-size: .72rem; opacity: .65; }}
+.kb-sb-label {{ font-size: .72rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; opacity: .55; margin: .9rem 0 .25rem; }}
+[data-testid="stSidebar"] hr {{ margin: .8rem 0; opacity: .5; }}
 
 /* Hero */
 .kb-hero {{
   position: relative; overflow: hidden;
-  border-radius: 22px; padding: 26px 30px; margin-bottom: 18px;
+  border-radius: 22px; padding: 28px 32px; margin: 0 0 20px;
   background: linear-gradient(135deg, #0f766e 0%, #0e7490 45%, #1d4ed8 100%);
   color: #fff; box-shadow: 0 18px 45px -22px rgba(2, 44, 80, .55);
 }}
@@ -1689,8 +1717,18 @@ footer {{ visibility: hidden; }}
   background: radial-gradient(600px 220px at {'0%' if rtl else '100%'} 0%, rgba(255,255,255,.18), transparent 60%);
   pointer-events: none;
 }}
-.kb-hero h1 {{ font-size: 1.85rem; margin: 0 0 6px 0; font-weight: 800; letter-spacing: -.01em; color: #fff; }}
-.kb-hero p  {{ margin: 0; opacity: .92; font-size: 1rem; }}
+.kb-hero h1 a, .kb-hero [data-testid="stHeaderActionElements"] {{ display: none !important; }}
+.kb-hero h1 {{ font-size: 1.9rem; margin: 0 0 6px 0; font-weight: 800; letter-spacing: -.01em; color: #fff; line-height: 1.25; }}
+.kb-hero p  {{ margin: 0; opacity: .92; font-size: 1rem; max-width: 62ch; }}
+.kb-chips {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; position: relative; z-index: 1; }}
+.kb-chips span {{
+  font-size: .8rem; font-weight: 600; padding: 5px 11px; border-radius: 999px;
+  background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.22); backdrop-filter: blur(4px);
+}}
+.kb-empty {{
+  border: 1.5px dashed rgba(128,128,128,.35); border-radius: 16px; padding: 22px; text-align: center; opacity: .75;
+  margin-top: 4px;
+}}
 .kb-badge {{
   display: inline-block; font-size: .78rem; font-weight: 600; letter-spacing: .04em;
   padding: 4px 10px; border-radius: 999px; background: rgba(255,255,255,.18); margin-bottom: 10px;
@@ -1702,10 +1740,14 @@ footer {{ visibility: hidden; }}
   border: 1px solid rgba(128,128,128,.18) !important;
   background: var(--secondary-background-color);
   box-shadow: 0 10px 30px -22px rgba(0,0,0,.35);
-  padding: 1.1rem 1.2rem !important;
+  padding: 1.15rem 1.3rem 1.2rem !important;
 }}
 .kb-card-title {{
-  font-weight: 700; font-size: 1.05rem; margin: 0 0 .6rem 0; display: flex; align-items: center; gap: .5rem;
+  font-weight: 800; font-size: 1.05rem; margin: 0 0 .75rem 0; display: flex; align-items: center; gap: .55rem;
+}}
+.kb-card-title > span:first-child {{
+  width: 32px; height: 32px; border-radius: 10px; display: grid; place-items: center; font-size: 1rem;
+  background: rgba(15,118,110,.10);
 }}
 
 /* Stat tiles */
@@ -1747,7 +1789,7 @@ footer {{ visibility: hidden; }}
 [data-testid="stFileUploaderDropzone"] {{ border-radius: 14px; }}
 [data-testid="stProgressBar"] > div > div {{ border-radius: 999px; }}
 [data-testid="stProgressBar"] > div > div > div {{ background: linear-gradient(90deg, #0f766e, #1d4ed8); border-radius: 999px; }}
-[data-testid="stSegmentedControl"] {{ margin-top: 14px; }}
+[data-testid="stSegmentedControl"] {{ margin-top: 0; }}
 [data-testid="stSegmentedControl"] button {{ border-radius: 10px !important; font-weight: 600; }}
 [data-testid="stSidebar"] [data-testid="stExpander"] details {{ border-radius: 12px; }}
 /* Sliders/segmented controls are LTR widgets: keep their geometry LTR, labels stay {direction} */
@@ -1759,10 +1801,20 @@ footer {{ visibility: hidden; }}
     )
 
 
-def hero(title: str, subtitle: str, badge: str) -> None:
+def hero(title: str, subtitle: str, badge: str, chips: list[str]) -> None:
+    chip_html = "".join(f"<span>{c}</span>" for c in chips)
     st.markdown(
         f'<div class="kb-hero"><span class="kb-badge">{badge}</span>'
-        f"<h1>🇰🇼 {title}</h1><p>{subtitle}</p></div>",
+        f"<h1>🇰🇼 {title}</h1><p>{subtitle}</p>"
+        f'<div class="kb-chips">{chip_html}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def sidebar_brand(name: str, sub: str) -> None:
+    st.markdown(
+        f'<div class="kb-brand"><div class="logo">🇰🇼</div>'
+        f'<div><div class="name">{name}</div><div class="sub">{sub}</div></div></div>',
         unsafe_allow_html=True,
     )
 
@@ -1837,9 +1889,9 @@ ss.setdefault("input_name", None)
 ss.setdefault("uploader_key", 0)
 ss.setdefault("flash", None)
 
-# ---- header + language switcher ------------------------------------------ #
-h_main, h_lang = st.columns([5, 1.2])
-with h_lang:
+# ---- sidebar top: brand + language switcher ------------------------------- #
+with st.sidebar:
+    sidebar_brand(t("brand"), t("hero_badge"))
     choice = st.segmented_control(
         t("lang"), options=list(LANGS), format_func=lambda k: LANGS[k],
         default=LANG, key="lang_ctl", label_visibility="collapsed", width="stretch",
@@ -1848,8 +1900,11 @@ with h_lang:
         ss.lang = choice
         st.query_params["lang"] = choice
         st.rerun()
-with h_main:
-    hero(t("app_title"), t("app_subtitle"), t("hero_badge"))
+    st.markdown("---")
+
+# ---- header --------------------------------------------------------------- #
+hero(t("app_title"), t("app_subtitle"), t("hero_badge"),
+     [f"🏛️ {t('chip_moi')}", f"🪪 {t('chip_paci')}", f"☁️ {t('chip_batch')}"])
 
 # ---- one-time browser bootstrap ------------------------------------------- #
 try:
@@ -1865,10 +1920,8 @@ running = job is not None and job.running
 
 # ---- sidebar -------------------------------------------------------------- #
 with st.sidebar:
-    st.header("⚙️ " + t("settings"))
-
     # -- what to look up (the everyday controls) --
-    st.markdown(f"**{t('services')}**")
+    st.markdown(f'<div class="kb-sb-label">{t("services")}</div>', unsafe_allow_html=True)
     do_moi = st.checkbox(t("svc_moi"), value=True)
     do_status = st.checkbox(t("svc_status"), value=True)
     do_renew = st.checkbox(t("svc_renew"), value=True)
@@ -1888,8 +1941,7 @@ with st.sidebar:
         restart_every = st.slider(t("restart_every"), 10, 200, 20 if ON_CLOUD else 40, 10)
         block_trackers = st.toggle(t("block_trackers"), value=True, help=t("block_trackers_help"))
 
-    st.markdown(f"<div style='opacity:.6;font-size:.8rem;margin-top:.8rem'>{t('diagnostics')}</div>",
-                unsafe_allow_html=True)
+    st.markdown(f'<div class="kb-sb-label">{t("diagnostics")}</div>', unsafe_allow_html=True)
     with st.expander("🧭 " + t("sysinfo")):
         st.code(f"python {platform.python_version()} / {platform.system()}\n{boot_msg.splitlines()[0]}")
         if job is not None:
@@ -1963,7 +2015,7 @@ if ss.input_df is not None or job is not None:
         reset_clicked = b3.button("🧹 " + t("reset"), width="stretch", disabled=running or (job is None and ss.input_df is None),
                                   help=t("reset_help"))
 else:
-    st.caption("💡 " + t("empty_hint"))
+    st.markdown(f'<div class="kb-empty">💡 {t("empty_hint")}</div>', unsafe_allow_html=True)
 
 if reset_clicked:
     reset_everything()
