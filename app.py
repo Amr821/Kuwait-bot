@@ -30,6 +30,14 @@ Hardened for Streamlit Community Cloud (Debian container, no root, ~1 GB RAM):
         browser (two Chromiums on 1 GB = OOM = TargetClosedError);
       - progress UI is a non-blocking st.fragment that ships only a window
         of rows, not all 735 every second.
+  * Cloud-crash hardening (renderer dies on first real page):
+      - fonts + fontconfig are vendored (no fonts → renderer CHECK on first
+        text layout), the boot probe types/clicks/paints like a real row;
+      - ONE page for both sites and one renderer (no site isolation) so a
+        1 GB container is not OOM-killing the target;
+      - launch-profile ladder: headless-shell → full Chromium new headless →
+        --single-process; chosen at boot by the probe, advanced at runtime
+        after two consecutive dead targets. Everything is logged with RAM.
   * All Playwright work runs in a dedicated worker thread (avoids the
     "Sync API inside asyncio loop" error) and survives Streamlit reruns.
 
@@ -138,7 +146,7 @@ CHROMIUM_ARGS = [
     "--disable-site-isolation-trials",
     "--disable-features=TranslateUI,AudioServiceOutOfProcess,MediaRouter,"
     "OptimizationHints,InterestFeedContentSuggestions,IsolateOrigins,site-per-process",
-    "--renderer-process-limit=2",
+    "--renderer-process-limit=1",
     "--disable-blink-features=AutomationControlled",
     "--lang=ar-KW,ar",
 ]
@@ -157,11 +165,28 @@ _CLOSED_MARKERS = (
 )
 
 
-def launch_kwargs() -> dict:
-    """Common `chromium.launch(**kwargs)` options for probe + scraper."""
-    return dict(
+# Launch profiles, tried in order. The boot probe (which types, clicks and
+# paints like a real row) picks the first that survives; the scraper moves
+# to the next one if a target still dies twice in a row at runtime.
+#   0  chromium-headless-shell (Playwright default, smallest)
+#   1  full Chromium in new headless mode (different binary/code path)
+#   2  headless-shell with --single-process (no renderer spawn at all – for
+#      containers where forking the renderer fails or RAM is very tight)
+LAUNCH_PROFILES = (
+    {"name": "headless-shell"},
+    {"name": "chromium-new-headless", "channel": "chromium"},
+    {"name": "single-process", "extra_args": ["--single-process", "--no-zygote"]},
+)
+_PROFILE = {"idx": 0}   # chosen by ensure_chromium(); bumped by GovScraper
+
+
+def launch_kwargs(profile_idx: int | None = None) -> dict:
+    """`chromium.launch(**kwargs)` options for the given (or current) profile."""
+    idx = _PROFILE["idx"] if profile_idx is None else profile_idx
+    prof = LAUNCH_PROFILES[min(idx, len(LAUNCH_PROFILES) - 1)]
+    kw = dict(
         headless=True,
-        args=CHROMIUM_ARGS,
+        args=[*CHROMIUM_ARGS, *prof.get("extra_args", [])],
         chromium_sandbox=False,
         timeout=LAUNCH_TIMEOUT_MS,
         # Streamlit owns the process signals; don't let the driver tear the
@@ -170,6 +195,14 @@ def launch_kwargs() -> dict:
         handle_sigterm=False,
         handle_sighup=False,
     )
+    if prof.get("channel"):
+        kw["channel"] = prof["channel"]
+    return kw
+
+
+def profile_name(idx: int | None = None) -> str:
+    idx = _PROFILE["idx"] if idx is None else idx
+    return LAUNCH_PROFILES[min(idx, len(LAUNCH_PROFILES) - 1)]["name"]
 
 
 def is_closed_error(exc: BaseException) -> bool:
@@ -179,6 +212,13 @@ def is_closed_error(exc: BaseException) -> bool:
     msg = str(exc)
     return any(m in msg for m in _CLOSED_MARKERS)
 BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+# Third-party analytics/ads have no part in the lookup; every request the page
+# skips is RAM and CPU the renderer never spends. reCAPTCHA must NOT be here.
+BLOCKED_URL_PARTS = (
+    "google-analytics.com", "googletagmanager.com", "doubleclick.net",
+    "facebook.net", "facebook.com/tr", "hotjar.com", "clarity.ms",
+    "googlesyndication.com", "twitter.com/i/adsct", "linkedin.com/px",
+)
 
 # Extra shared libs chrome-headless-shell needs beyond Playwright's minimal
 # debian13 chromium list (Cloud reported libXrender.so.1 missing).
@@ -633,7 +673,7 @@ def _raw_chromium_smoke() -> str:
     return f"raw chromium smoke: exit {code}\n{out[-1500:]}"
 
 
-def _launch_probe() -> str:
+def _launch_probe(profile_idx: int | None = None) -> str:
     """Start Chromium briefly; return its executable path on success.
 
     Checking `executable_path` alone is not enough – Playwright may point at a
@@ -643,7 +683,7 @@ def _launch_probe() -> str:
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(**launch_kwargs())
+        browser = p.chromium.launch(**launch_kwargs(profile_idx))
         try:
             # Do what the first real row does: layout (innerText), visibility
             # checks, typing into an input, a click and a paint (screenshot).
@@ -660,20 +700,34 @@ def _launch_probe() -> str:
             browser.close()
 
 
-def _chromium_works() -> str | None:
+def _chromium_works(profile_idx: int | None = None) -> str | None:
     """Return executable path if a headless launch succeeds, else None."""
     try:
-        return _in_thread(_launch_probe)
+        return _in_thread(lambda: _launch_probe(profile_idx))
     except Exception:
         return None
 
 
-def _last_launch_error() -> str:
+def _last_launch_error(profile_idx: int | None = None) -> str:
     try:
-        _in_thread(_launch_probe)
+        _in_thread(lambda: _launch_probe(profile_idx))
         return ""
     except Exception as exc:  # noqa: BLE001
         return f"{type(exc).__name__}: {exc}"
+
+
+def _pick_profile(notes: list[str]) -> str | None:
+    """Try launch profiles in order; return exe of the first that passes."""
+    for idx in range(len(LAUNCH_PROFILES)):
+        exe = _chromium_works(idx)
+        if exe:
+            _PROFILE["idx"] = idx
+            if idx:
+                notes.append(f"launch profile #{idx} '{profile_name(idx)}' selected "
+                             "(earlier profiles crashed in the probe)")
+            return exe
+        notes.append(f"profile '{profile_name(idx)}' failed: {_last_launch_error(idx)[:300]}")
+    return None
 
 
 def _install_chromium() -> str:
@@ -711,14 +765,21 @@ def ensure_chromium() -> str:
     # Iteratively vendor whatever .so the launcher still complains about
     # (e.g. libXrender.so.1 → libxrender1).
     for attempt in range(8):
-        exe = _chromium_works()
+        exe = _chromium_works(0)
         if exe:
-            return f"Chromium ready: {exe}\n" + "\n".join(notes)
-        err = _last_launch_error()
+            _PROFILE["idx"] = 0
+            return f"Chromium ready [{profile_name()}]: {exe}\n" + "\n".join(notes)
+        err = _last_launch_error(0)
         if not IS_LINUX or not _missing_soname(err):
             notes.append(f"launch still failing (attempt {attempt + 1}): {err}")
             break
         notes.append(_fix_missing_so(err))
+
+    # Libraries are fine but the default profile crashes when it renders /
+    # types – try the other browser configurations before giving up.
+    exe = _pick_profile(notes)
+    if exe:
+        return f"Chromium ready [{profile_name()}]: {exe}\n" + "\n".join(notes)
 
     launch_err = _last_launch_error()
     raise RuntimeError(
@@ -834,6 +895,35 @@ def kill_chromium_processes() -> int:
     return killed
 
 
+def memory_report() -> str:
+    """RSS of this process and of every Chromium/driver child (Linux only)."""
+    if not IS_LINUX:
+        return ""
+
+    def rss_mb(pid: int) -> float:
+        try:
+            for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+        except Exception:
+            pass
+        return 0.0
+
+    own = rss_mb(os.getpid())
+    kids = _descendant_pids(os.getpid())
+    browser = sum(rss_mb(pid) for pid in kids)
+    limit = ""
+    for f in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            v = Path(f).read_text().strip()
+            if v.isdigit() and int(v) < 1 << 50:
+                limit = f" / limit {int(v) / 1024 / 1024:.0f} MB"
+                break
+        except Exception:
+            continue
+    return f"RAM: app {own:.0f} MB + browser {browser:.0f} MB ({len(kids)} procs){limit}"
+
+
 class GovScraper:
     UA = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -848,10 +938,12 @@ class GovScraper:
         self.hard_limit_s = timeout_s * 2 + 30
         self._log = log or (lambda _m: None)
         self.relaunches = 0
+        self.closed_errors_in_a_row = 0
         self.op_deadline: float | None = None   # monotonic; read by the watchdog
         self._pw = None
         self.browser = None
         self.context = None
+        self.page = None
         self.moi_page = None
         self.paci_page = None
         self._paci_loaded = False
@@ -879,19 +971,25 @@ class GovScraper:
                 self.context.set_default_timeout(self.timeout_ms)
                 self.context.set_default_navigation_timeout(self.timeout_ms)
                 self.context.route("**/*", self._route)
-                self.moi_page = self.context.new_page()
-                self.paci_page = self.context.new_page()
+                # ONE page for both sites. A second page meant a second
+                # renderer (+ reCAPTCHA frames) – on a 1 GB container that is
+                # the difference between working and an OOM-killed target.
+                # The job orders PACI status → renewal → MOI so the PACI page is
+                # loaded once per row and MOI navigates away afterwards.
+                self.page = self.context.new_page()
+                self.moi_page = self.paci_page = self.page
                 self.crashes = 0
-                for name, pg in (("MOI", self.moi_page), ("PACI", self.paci_page)):
-                    pg.on("crash", lambda _pg, n=name: self._on_crash(n))
+                self.page.on("crash", lambda _pg: self._on_crash("main"))
                 self._paci_loaded = False
                 self.op_deadline = None
                 return
             except Exception as exc:  # noqa: BLE001
                 last = exc
                 self._teardown()
-                self._log(f"فشل تشغيل المتصفح (محاولة {attempt}/{LAUNCH_ATTEMPTS}): "
+                self._log(f"فشل تشغيل المتصفح [{profile_name()}] (محاولة {attempt}/{LAUNCH_ATTEMPTS}): "
                           f"{type(exc).__name__}: {exc}")
+                if attempt == LAUNCH_ATTEMPTS - 1:
+                    self.next_profile("فشل التشغيل")
                 time.sleep(2 * attempt)
         self.op_deadline = None
         raise RuntimeError(f"Chromium launch failed after {LAUNCH_ATTEMPTS} attempts: {last}")
@@ -913,7 +1011,7 @@ class GovScraper:
             except Exception:
                 pass
         self._pw = self.browser = self.context = None
-        self.moi_page = self.paci_page = None
+        self.page = self.moi_page = self.paci_page = None
         self._paci_loaded = False
 
     def alive(self) -> bool:
@@ -921,8 +1019,7 @@ class GovScraper:
             return (
                 self.browser is not None
                 and self.browser.is_connected()
-                and self.moi_page is not None and not self.moi_page.is_closed()
-                and self.paci_page is not None and not self.paci_page.is_closed()
+                and self.page is not None and not self.page.is_closed()
             )
         except Exception:
             return False
@@ -930,7 +1027,7 @@ class GovScraper:
     def relaunch(self, reason: str = ""):
         """Kill whatever is left and bring up a fresh browser."""
         self.relaunches += 1
-        self._log(f"إعادة تشغيل المتصفح ({self.relaunches}) {reason}".rstrip())
+        self._log(f"إعادة تشغيل المتصفح ({self.relaunches}) [{profile_name()}] {reason}".rstrip())
         self._teardown()
         kill_chromium_processes()  # nothing survives a relaunch (no zombie RAM)
         self._launch()
@@ -939,11 +1036,36 @@ class GovScraper:
         if not self.alive():
             self.relaunch("— المتصفح أُغلق أو تعطل")
 
+    def next_profile(self, why: str) -> bool:
+        """Switch to the next launch profile (if any). Process-wide."""
+        if _PROFILE["idx"] + 1 >= len(LAUNCH_PROFILES):
+            return False
+        _PROFILE["idx"] += 1
+        self._log(f"🔁 تبديل إعدادات تشغيل المتصفح إلى '{profile_name()}' ({why}).")
+        return True
+
     @staticmethod
     def _route(route, request):
         if request.resource_type in BLOCKED_RESOURCE_TYPES:
             return route.abort()
+        url = request.url
+        if any(part in url for part in BLOCKED_URL_PARTS):
+            return route.abort()
         return route.continue_()
+
+    def state(self) -> str:
+        """One-line diagnostic used in logs after a failure."""
+        try:
+            connected = self.browser is not None and self.browser.is_connected()
+        except Exception:
+            connected = False
+        try:
+            closed = self.page is None or self.page.is_closed()
+            url = self.page.url if not closed else "-"
+        except Exception:
+            closed, url = True, "-"
+        return (f"browser connected={connected} page closed={closed} crashes={self.crashes} "
+                f"url={url[:80]} {memory_report()}").strip()
 
     # ---------------------------------------------------------------- MOI --- #
     def moi_fines(self, civil_id: str) -> str:
@@ -1069,15 +1191,24 @@ class GovScraper:
             try:
                 self.ensure_alive()
                 out = self._guarded(fn, civil_id)
+                self.closed_errors_in_a_row = 0
                 if not out.startswith(RETRYABLE) or attempt == retries:
                     return out
                 last = out
             except Exception as exc:  # noqa: BLE001
                 last = f"{ERR_GENERIC}: {type(exc).__name__}"
                 self._paci_loaded = False
+                self._log(f"❌ {civil_id} {getattr(fn, '__name__', '?')}: {type(exc).__name__}: "
+                          f"{str(exc).splitlines()[0][:160]} | {self.state()}")
                 if is_closed_error(exc):
                     # Browser/renderer died (OOM, crash, watchdog kill). Relaunch
                     # and give the same row one more chance instead of failing.
+                    # Twice in a row with no success in between → this browser
+                    # configuration cannot render these pages here: switch.
+                    self.closed_errors_in_a_row += 1
+                    if self.closed_errors_in_a_row >= 2:
+                        if self.next_profile(f"{type(exc).__name__} ×{self.closed_errors_in_a_row}"):
+                            self.closed_errors_in_a_row = 0
                     try:
                         self.relaunch(f"— {type(exc).__name__}")
                     except Exception as launch_exc:  # noqa: BLE001
@@ -1191,16 +1322,17 @@ class ScrapeJob:
     # -- worker --
     def _run(self):
         o = self.opts
+        # PACI first (both queries on one page load), then MOI navigates away.
         services = [
-            (COL_MOI, o["do_moi"], "moi_fines", "الداخلية"),
             (COL_STATUS, o["do_status"], "paci_card_status", "حالة البطاقة"),
             (COL_RENEW, o["do_renew"], "paci_card_renewal", "تجديد البطاقة"),
+            (COL_MOI, o["do_moi"], "moi_fines", "الداخلية"),
         ]
         scraper = None
         try:
             scraper = GovScraper(headless=o["headless"], timeout_s=o["timeout_s"], log=self.log)
             self.scraper = scraper
-            self.log("تم تشغيل Chromium.")
+            self.log(f"تم تشغيل Chromium. {memory_report()}".strip())
             rows_since_restart = 0
 
             for i, (idx, row) in enumerate(self.df.iterrows(), start=1):
@@ -1240,7 +1372,8 @@ class ScrapeJob:
 
                 self.processed = i
                 rows_since_restart += 1
-                self.log(f"{cid} | الصف {i}/{self.total} في {time.monotonic() - t0:.1f} ث")
+                mem = f" | {memory_report()}" if IS_LINUX and i % 10 == 0 else ""
+                self.log(f"{cid} | الصف {i}/{self.total} في {time.monotonic() - t0:.1f} ث{mem}")
 
                 # Circuit breaker: a site that stopped answering should not cost
                 # 735 × timeout. Pause with back-off, then give up with a clear
@@ -1291,8 +1424,9 @@ def run_quick_test(civil_id: str, timeout_s: int) -> str:
     except Exception:  # noqa: BLE001
         return "فشل تشغيل المتصفح:\n" + traceback.format_exc() + "\n" + "\n".join(logs)
     try:
-        for label, fn in (("الداخلية", s.moi_fines), ("حالة البطاقة", s.paci_card_status),
-                          ("تجديد البطاقة", s.paci_card_renewal)):
+        lines.append(memory_report())
+        for label, fn in (("حالة البطاقة", s.paci_card_status), ("تجديد البطاقة", s.paci_card_renewal),
+                          ("الداخلية", s.moi_fines)):
             t0 = time.monotonic()
             try:
                 out = fn(civil_id)
@@ -1300,15 +1434,10 @@ def run_quick_test(civil_id: str, timeout_s: int) -> str:
             except Exception as exc:  # noqa: BLE001
                 lines.append(f"❌ {label} ({time.monotonic() - t0:.1f}s): {type(exc).__name__}: {exc}")
                 lines.append(traceback.format_exc()[-1500:])
-                lines.append(f"browser connected: {s.alive()} | renderer crashes: {getattr(s, 'crashes', 0)}")
-                for name, pg in (("MOI", s.moi_page), ("PACI", s.paci_page)):
-                    try:
-                        lines.append(f"{name} page: closed={pg.is_closed()} url={pg.url}")
-                    except Exception as e2:  # noqa: BLE001
-                        lines.append(f"{name} page: {type(e2).__name__}")
+                lines.append(s.state())
                 if is_closed_error(exc):
                     s.relaunch("— quick test")
-        lines.append(f"المجموع: {time.monotonic() - t_all:.1f}s | relaunches={s.relaunches}")
+        lines.append(f"المجموع: {time.monotonic() - t_all:.1f}s | relaunches={s.relaunches} | profile={profile_name()}")
     finally:
         s.close()
     if IS_LINUX:
