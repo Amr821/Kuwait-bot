@@ -1481,128 +1481,490 @@ def set_job(job: ScrapeJob | None) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# i18n
+# --------------------------------------------------------------------------- #
+LANGS = {"ar": "العربية", "en": "English"}
+T: dict[str, dict[str, str]] = {
+    "ar": {
+        "page_title": "استعلام الداخلية و الهيئة المدنية",
+        "app_title": "الاستعلام الآلي عن الغرامات والبطاقة المدنية",
+        "app_subtitle": "غرامات الإقامة (وزارة الداخلية) • حالة البطاقة وتجديدها (الهيئة العامة للمعلومات المدنية)",
+        "hero_badge": "معالجة دفعات Excel",
+        "boot_spinner": "جاري تجهيز المتصفح (يحدث مرة واحدة عند أول تشغيل)…",
+        "boot_error": "تعذر تثبيت/تشغيل Chromium. راجع سجل الخطأ أدناه و requirements.txt.",
+        "settings": "الإعدادات",
+        "cloud_note": "بيئة خادم بدون شاشة — المتصفح يعمل في الخلفية إجبارياً.",
+        "headless": "تشغيل المتصفح في الخلفية (Headless)",
+        "timeout": "مهلة انتظار النتيجة (ثانية)",
+        "delay": "فاصل زمني بين كل رقم مدني (ثانية)",
+        "retries": "عدد إعادة المحاولة عند انتهاء المهلة",
+        "restart_every": "إعادة تشغيل المتصفح كل N صف (لتوفير الذاكرة)",
+        "skip_filled": "تخطي الخلايا المعبأة مسبقاً",
+        "skip_filled_help": "لاستكمال ملف سبق تحميله جزئياً: ارفع ملف النتائج وسيُكمل من حيث توقف.",
+        "services": "الخدمات",
+        "svc_moi": "الداخلية — غرامات الإقامة",
+        "svc_status": "الهيئة المدنية — حالة البطاقة",
+        "svc_renew": "الهيئة المدنية — تجديد البطاقة",
+        "sysinfo": "معلومات النظام",
+        "started": "بدأ",
+        "relaunches": "إعادة تشغيل المتصفح",
+        "watchdog": "تدخلات المراقب",
+        "cooldowns": "فترات تهدئة",
+        "boot_log": "سجل تجهيز المتصفح الكامل:",
+        "quick_test": "اختبار سريع لرقم واحد",
+        "quick_test_help": "يستعلم عن رقم واحد ويعرض الخطأ الكامل إن حدث (مفيد للتشخيص).",
+        "test_cid": "الرقم المدني للاختبار",
+        "run_test": "تشغيل الاختبار",
+        "testing": "جاري الاختبار…",
+        "upload_title": "رفع الملف",
+        "upload_label": "اختر ملف Excel",
+        "upload_help": "يجب أن يحتوي الملف الأعمدة: {cols} — تُعبأ الأعمدة الثلاثة الأخيرة تلقائياً.",
+        "read_error": "تعذر قراءة الملف: {err}",
+        "missing_cols": "الأعمدة التالية غير موجودة في الملف: {cols}",
+        "existing_cols": "الأعمدة الموجودة:",
+        "file_loaded": "تم تحميل الملف: {name}",
+        "running_banner": "يوجد استعلام قيد التنفيذ منذ {time} — يمكنك إغلاق الصفحة والعودة لاحقاً؛ التقدم محفوظ على الخادم.",
+        "preview_title": "معاينة الملف",
+        "stat_rows": "إجمالي الصفوف",
+        "stat_valid": "أرقام مدنية صالحة",
+        "stat_processed": "تمت معالجتها",
+        "stat_errors": "خلايا بها خطأ",
+        "start": "بدء الاستعلام",
+        "stop": "إيقاف",
+        "reset": "إعادة ضبط / مسح العملية",
+        "reset_help": "يمسح نتائج العملية الحالية والملف المرفوع ويبدأ من جديد دون إعادة تشغيل الخادم.",
+        "reset_done": "تم مسح العملية. يمكنك رفع ملف جديد.",
+        "progress_title": "تقدم التنفيذ",
+        "progress_text": "الصف {done} من {total} — {cid}",
+        "eta_text": "جاري الاستعلام… {cid} — ~{per_row:.0f} ث/صف — الوقت المتبقي التقريبي: {eta:.0f} دقيقة",
+        "err_stopped": "توقف التنفيذ بسبب خطأ: {err}",
+        "stopped_warning": "تم إيقاف التنفيذ. يمكنك تحميل النتائج الجزئية أدناه.",
+        "finished_ok": "انتهى الاستعلام لجميع الصفوف ✅",
+        "preview_window": "عرض الصفوف {lo}–{hi} (النتائج الكاملة في ملف التحميل)",
+        "log_title": "سجل التنفيذ",
+        "download_partial": "تحميل Excel (النتائج الجزئية حتى الآن)",
+        "download_final": "تحميل ملف Excel المحدث",
+        "status_idle": "جاهز",
+        "status_running": "قيد التنفيذ",
+        "status_finished": "مكتمل",
+        "status_stopped": "متوقف",
+        "status_failed": "فشل",
+        "empty_hint": "ارفع ملف Excel للبدء.",
+        "lang": "اللغة",
+    },
+    "en": {
+        "page_title": "MOI & PACI Bulk Lookup",
+        "app_title": "Automated Fines & Civil ID Card Lookup",
+        "app_subtitle": "Residence fines (Ministry of Interior) • Card status and renewal (Public Authority for Civil Information)",
+        "hero_badge": "Excel batch processing",
+        "boot_spinner": "Preparing the browser (one-time setup on first run)…",
+        "boot_error": "Could not install/launch Chromium. See the error log below and requirements.txt.",
+        "settings": "Settings",
+        "cloud_note": "Headless server environment — the browser always runs in the background.",
+        "headless": "Run browser in background (headless)",
+        "timeout": "Result timeout (seconds)",
+        "delay": "Delay between civil IDs (seconds)",
+        "retries": "Retries on timeout",
+        "restart_every": "Restart browser every N rows (memory)",
+        "skip_filled": "Skip already-filled cells",
+        "skip_filled_help": "To resume a partially completed file: upload the results file and it continues where it stopped.",
+        "services": "Services",
+        "svc_moi": "MOI — Residence fines",
+        "svc_status": "PACI — Card status",
+        "svc_renew": "PACI — Card renewal",
+        "sysinfo": "System info",
+        "started": "Started",
+        "relaunches": "Browser relaunches",
+        "watchdog": "Watchdog interventions",
+        "cooldowns": "Cool-down pauses",
+        "boot_log": "Full browser bootstrap log:",
+        "quick_test": "Quick test (single ID)",
+        "quick_test_help": "Looks up one civil ID and shows the full error if any (useful for diagnosis).",
+        "test_cid": "Civil ID to test",
+        "run_test": "Run test",
+        "testing": "Testing…",
+        "upload_title": "Upload file",
+        "upload_label": "Choose an Excel file",
+        "upload_help": "The file must contain the columns: {cols} — the last three are filled automatically.",
+        "read_error": "Could not read the file: {err}",
+        "missing_cols": "These columns are missing from the file: {cols}",
+        "existing_cols": "Columns found:",
+        "file_loaded": "File loaded: {name}",
+        "running_banner": "A lookup has been running since {time} — you can close this page and come back later; progress is kept on the server.",
+        "preview_title": "File preview",
+        "stat_rows": "Total rows",
+        "stat_valid": "Valid civil IDs",
+        "stat_processed": "Processed",
+        "stat_errors": "Cells with errors",
+        "start": "Start lookup",
+        "stop": "Stop",
+        "reset": "Reset / Clear job",
+        "reset_help": "Clears the current job results and the uploaded file so you can start fresh without restarting the server.",
+        "reset_done": "Job cleared. You can upload a new file.",
+        "progress_title": "Progress",
+        "progress_text": "Row {done} of {total} — {cid}",
+        "eta_text": "Looking up… {cid} — ~{per_row:.0f} s/row — estimated time left: {eta:.0f} min",
+        "err_stopped": "Stopped because of an error: {err}",
+        "stopped_warning": "Stopped. You can download the partial results below.",
+        "finished_ok": "Lookup finished for all rows ✅",
+        "preview_window": "Showing rows {lo}–{hi} (full results are in the download)",
+        "log_title": "Execution log",
+        "download_partial": "Download Excel (partial results so far)",
+        "download_final": "Download updated Excel file",
+        "status_idle": "Ready",
+        "status_running": "Running",
+        "status_finished": "Finished",
+        "status_stopped": "Stopped",
+        "status_failed": "Failed",
+        "empty_hint": "Upload an Excel file to begin.",
+        "lang": "Language",
+    },
+}
+
+
+def _resolve_lang() -> str:
+    ss = st.session_state
+    if "lang" not in ss:
+        q = st.query_params.get("lang", "ar")
+        ss.lang = q if q in LANGS else "ar"
+    return ss.lang
+
+
+def t(key: str, **kw) -> str:
+    text = T.get(LANG, T["ar"]).get(key) or T["ar"].get(key) or key
+    return text.format(**kw) if kw else text
+
+
+# --------------------------------------------------------------------------- #
+# Styling
+# --------------------------------------------------------------------------- #
+def inject_css(rtl: bool) -> None:
+    direction = "rtl" if rtl else "ltr"
+    align = "right" if rtl else "left"
+    font = "'Tajawal', 'Inter', system-ui, sans-serif" if rtl else "'Inter', 'Tajawal', system-ui, sans-serif"
+    st.markdown(
+        f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Tajawal:wght@400;500;700;800&display=swap');
+
+html, body, .stApp, [data-testid="stSidebar"] {{
+  font-family: {font};
+}}
+.stApp {{ direction: {direction}; }}
+[data-testid="stSidebar"] {{ direction: {direction}; }}
+.stMarkdown, .stButton, .stDownloadButton, .stDataFrame, .stAlert, label, .stCaption {{
+  direction: {direction}; text-align: {align};
+}}
+.stApp {{
+  background:
+    radial-gradient(1200px 500px at {'100%' if rtl else '0%'} -10%, rgba(0,120,120,.12), transparent 60%),
+    radial-gradient(900px 400px at {'0%' if rtl else '100%'} 0%, rgba(0,80,200,.10), transparent 60%),
+    var(--background-color);
+}}
+/* Hide the default footer / decorations */
+footer {{ visibility: hidden; }}
+[data-testid="stDecoration"] {{ display: none; }}
+.block-container {{ padding-top: 4.4rem; padding-bottom: 3rem; max-width: 1200px; }}
+
+/* Hero */
+.kb-hero {{
+  position: relative; overflow: hidden;
+  border-radius: 22px; padding: 26px 30px; margin-bottom: 18px;
+  background: linear-gradient(135deg, #0f766e 0%, #0e7490 45%, #1d4ed8 100%);
+  color: #fff; box-shadow: 0 18px 45px -22px rgba(2, 44, 80, .55);
+}}
+.kb-hero::after {{
+  content: ""; position: absolute; inset: 0;
+  background: radial-gradient(600px 220px at {'0%' if rtl else '100%'} 0%, rgba(255,255,255,.18), transparent 60%);
+  pointer-events: none;
+}}
+.kb-hero h1 {{ font-size: 1.85rem; margin: 0 0 6px 0; font-weight: 800; letter-spacing: -.01em; color: #fff; }}
+.kb-hero p  {{ margin: 0; opacity: .92; font-size: 1rem; }}
+.kb-badge {{
+  display: inline-block; font-size: .78rem; font-weight: 600; letter-spacing: .04em;
+  padding: 4px 10px; border-radius: 999px; background: rgba(255,255,255,.18); margin-bottom: 10px;
+}}
+
+/* Cards (bordered containers) */
+[data-testid="stVerticalBlockBorderWrapper"] > div:first-child {{
+  border-radius: 18px !important;
+  border: 1px solid rgba(128,128,128,.18) !important;
+  background: var(--secondary-background-color);
+  box-shadow: 0 10px 30px -22px rgba(0,0,0,.35);
+  padding: 1.1rem 1.2rem !important;
+}}
+.kb-card-title {{
+  font-weight: 700; font-size: 1.05rem; margin: 0 0 .6rem 0; display: flex; align-items: center; gap: .5rem;
+}}
+
+/* Stat tiles */
+.kb-stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 6px 0 14px; }}
+.kb-stat {{
+  border-radius: 14px; padding: 12px 14px;
+  background: var(--background-color); border: 1px solid rgba(128,128,128,.16);
+}}
+.kb-stat .v {{ font-size: 1.6rem; font-weight: 800; line-height: 1.1; }}
+.kb-stat .l {{ font-size: .8rem; opacity: .7; margin-top: 2px; }}
+.kb-stat.ok .v {{ color: #059669; }}
+.kb-stat.bad .v {{ color: #dc2626; }}
+.kb-stat.info .v {{ color: #2563eb; }}
+
+/* Status pill */
+.kb-pill {{
+  display: inline-flex; align-items: center; gap: 6px; font-size: .8rem; font-weight: 700;
+  padding: 4px 12px; border-radius: 999px; border: 1px solid transparent;
+}}
+.kb-pill .dot {{ width: 8px; height: 8px; border-radius: 50%; background: currentColor; }}
+.kb-pill.idle     {{ color: #475569; background: rgba(71,85,105,.12); }}
+.kb-pill.running  {{ color: #2563eb; background: rgba(37,99,235,.12); }}
+.kb-pill.running .dot {{ animation: kb-blink 1.2s infinite; }}
+.kb-pill.finished {{ color: #059669; background: rgba(5,150,105,.12); }}
+.kb-pill.stopped  {{ color: #d97706; background: rgba(217,119,6,.12); }}
+.kb-pill.failed   {{ color: #dc2626; background: rgba(220,38,38,.12); }}
+@keyframes kb-blink {{ 0%,100% {{ opacity: 1 }} 50% {{ opacity: .25 }} }}
+
+/* Buttons */
+.stButton > button, .stDownloadButton > button {{
+  border-radius: 12px !important; font-weight: 700 !important; padding: .6rem 1rem !important;
+  transition: transform .08s ease, box-shadow .15s ease;
+}}
+.stButton > button:hover, .stDownloadButton > button:hover {{ transform: translateY(-1px); }}
+.stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {{
+  background: linear-gradient(135deg, #0f766e, #1d4ed8) !important; border: none !important;
+  box-shadow: 0 10px 24px -12px rgba(29,78,216,.6);
+}}
+[data-testid="stFileUploaderDropzone"] {{ border-radius: 14px; }}
+[data-testid="stProgressBar"] > div > div {{ border-radius: 999px; }}
+[data-testid="stProgressBar"] > div > div > div {{ background: linear-gradient(90deg, #0f766e, #1d4ed8); border-radius: 999px; }}
+[data-testid="stSegmentedControl"] {{ margin-top: 14px; }}
+[data-testid="stSegmentedControl"] button {{ border-radius: 10px !important; font-weight: 600; }}
+[data-testid="stSidebar"] [data-testid="stExpander"] details {{ border-radius: 12px; }}
+/* Sliders/segmented controls are LTR widgets: keep their geometry LTR, labels stay {direction} */
+[data-testid="stSlider"] > div, [data-testid="stSegmentedControl"] > div {{ direction: ltr; }}
+[data-testid="stSlider"] label, [data-testid="stSlider"] [data-testid="stWidgetLabel"] {{ direction: {direction}; text-align: {align}; }}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def hero(title: str, subtitle: str, badge: str) -> None:
+    st.markdown(
+        f'<div class="kb-hero"><span class="kb-badge">{badge}</span>'
+        f"<h1>🇰🇼 {title}</h1><p>{subtitle}</p></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def card_title(icon: str, text: str, pill_html: str = "") -> None:
+    st.markdown(
+        f'<div class="kb-card-title"><span>{icon}</span><span>{text}</span>'
+        f'<span style="flex:1"></span>{pill_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def status_pill(state: str) -> str:
+    return f'<span class="kb-pill {state}"><span class="dot"></span>{t("status_" + state)}</span>'
+
+
+def stat_tiles(items: list[tuple[str, object, str]]) -> None:
+    tiles = "".join(f'<div class="kb-stat {cls}"><div class="v">{val}</div><div class="l">{label}</div></div>'
+                    for label, val, cls in items)
+    st.markdown(f'<div class="kb-stats">{tiles}</div>', unsafe_allow_html=True)
+
+
+def job_tiles(df: pd.DataFrame, j: ScrapeJob | None) -> None:
+    valid = int((df[COL_CID].str.len() == 12).sum())
+    snap = j.snapshot() if j is not None else df
+    errors = int(sum(snap[c].apply(is_error).sum() for c in (COL_MOI, COL_STATUS, COL_RENEW)))
+    stat_tiles([
+        (t("stat_rows"), len(df), "info"),
+        (t("stat_valid"), valid, "ok" if valid == len(df) else ""),
+        (t("stat_processed"), j.processed if j is not None else 0, "info"),
+        (t("stat_errors"), errors, "bad" if errors else "ok"),
+    ])
+
+
+def job_state(j: ScrapeJob | None) -> str:
+    if j is None:
+        return "idle"
+    if j.running:
+        return "running"
+    if j.error:
+        return "failed"
+    if j.stop_event.is_set():
+        return "stopped"
+    return "finished"
+
+
+def reset_everything() -> None:
+    """Forget the finished/stopped job and the uploaded file; keep Chromium bootstrap."""
+    j = current_job()
+    if j is not None and j.running:
+        return
+    set_job(None)
+    kill_chromium_processes()
+    ss = st.session_state
+    ss.input_df = None
+    ss.input_name = None
+    ss.uploader_key = ss.get("uploader_key", 0) + 1
+    ss.flash = "reset_done"
+
+
+# --------------------------------------------------------------------------- #
 # Streamlit UI
 # --------------------------------------------------------------------------- #
-st.set_page_config(page_title="استعلام الداخلية و الهيئة المدنية", page_icon="🇰🇼", layout="wide")
-st.markdown(
-    "<style>.stApp{direction:rtl} .stDataFrame,.stMarkdown,.stButton,.stDownloadButton{direction:rtl}</style>",
-    unsafe_allow_html=True,
-)
-st.title("🇰🇼 استعلام آلي: غرامات الإقامة (الداخلية) + حالة و تجديد البطاقة (PACI)")
-st.caption("ارفع ملف Excel يحتوي الأعمدة: " + " ، ".join(f"`{c}`" for c in REQUIRED_COLS)
-           + " — سيتم تعبئة الأعمدة الثلاثة الأخيرة تلقائياً.")
+LANG = _resolve_lang()
+RTL = LANG == "ar"
+st.set_page_config(page_title=t("page_title"), page_icon="🇰🇼", layout="wide")
+inject_css(RTL)
+
+ss = st.session_state
+ss.setdefault("input_df", None)
+ss.setdefault("input_name", None)
+ss.setdefault("uploader_key", 0)
+ss.setdefault("flash", None)
+
+# ---- header + language switcher ------------------------------------------ #
+h_main, h_lang = st.columns([5, 1.2])
+with h_lang:
+    choice = st.segmented_control(
+        t("lang"), options=list(LANGS), format_func=lambda k: LANGS[k],
+        default=LANG, key="lang_ctl", label_visibility="collapsed", width="stretch",
+    )
+    if choice and choice != LANG:
+        ss.lang = choice
+        st.query_params["lang"] = choice
+        st.rerun()
+with h_main:
+    hero(t("app_title"), t("app_subtitle"), t("hero_badge"))
 
 # ---- one-time browser bootstrap ------------------------------------------- #
 try:
-    with st.spinner("جاري تجهيز المتصفح (يحدث مرة واحدة عند أول تشغيل)…"):
+    with st.spinner(t("boot_spinner")):
         boot_msg = ensure_chromium()
 except Exception as exc:  # noqa: BLE001
-    st.error("تعذر تثبيت/تشغيل Chromium. راجع سجل الخطأ أدناه و requirements.txt.")
+    st.error(t("boot_error"))
     st.code(str(exc))
     st.stop()
 
 job = current_job()
 running = job is not None and job.running
 
+# ---- sidebar -------------------------------------------------------------- #
 with st.sidebar:
-    st.header("⚙️ الإعدادات")
+    st.header("⚙️ " + t("settings"))
     if ON_CLOUD:
-        st.caption("🖥️ بيئة خادم بدون شاشة — المتصفح يعمل Headless إجبارياً.")
+        st.caption("🖥️ " + t("cloud_note"))
         headless = True
     else:
-        headless = st.toggle("تشغيل المتصفح في الخلفية (Headless)", value=True)
-    timeout_s = st.slider("مهلة انتظار النتيجة (ثانية)", 10, 120, 45)
-    delay_s = st.slider("فاصل زمني بين كل رقم مدني (ثانية)", 0.0, 10.0, 2.0, 0.5)
-    retries = st.slider("عدد إعادة المحاولة عند انتهاء المهلة", 0, 3, 1)
-    restart_every = st.slider("إعادة تشغيل المتصفح كل N صف (لتوفير الذاكرة)", 10, 200,
-                              20 if ON_CLOUD else 40, 10)
-    skip_filled = st.checkbox("تخطي الخلايا المعبأة مسبقاً", value=True,
-                              help="لاستكمال ملف سبق تحميله جزئياً: ارفع ملف النتائج وسيُكمل من حيث توقف.")
+        headless = st.toggle(t("headless"), value=True)
+    timeout_s = st.slider(t("timeout"), 10, 120, 45)
+    delay_s = st.slider(t("delay"), 0.0, 10.0, 2.0, 0.5)
+    retries = st.slider(t("retries"), 0, 3, 1)
+    restart_every = st.slider(t("restart_every"), 10, 200, 20 if ON_CLOUD else 40, 10)
+    skip_filled = st.checkbox(t("skip_filled"), value=True, help=t("skip_filled_help"))
     st.markdown("---")
-    st.markdown("**الخدمات:**")
-    do_moi = st.checkbox("الداخلية - غرامات الإقامة", value=True)
-    do_status = st.checkbox("PACI - حالة البطاقة", value=True)
-    do_renew = st.checkbox("PACI - تجديد البطاقة", value=True)
-    with st.expander("معلومات النظام"):
+    st.markdown(f"**{t('services')}**")
+    do_moi = st.checkbox(t("svc_moi"), value=True)
+    do_status = st.checkbox(t("svc_status"), value=True)
+    do_renew = st.checkbox(t("svc_renew"), value=True)
+    with st.expander("🧭 " + t("sysinfo")):
         st.code(f"python {platform.python_version()} / {platform.system()}\n{boot_msg.splitlines()[0]}")
         if job is not None:
             st.code(
-                f"بدأ: {job.started_at:%H:%M:%S}\n"
-                f"إعادة تشغيل المتصفح: {job.scraper.relaunches if job.scraper else '-'}\n"
-                f"تدخلات المراقب: {job.watchdog_kills}\n"
-                f"فترات تهدئة: {job.cooldowns}"
+                f"{t('started')}: {job.started_at:%H:%M:%S}\n"
+                f"{t('relaunches')}: {job.scraper.relaunches if job.scraper else '-'}\n"
+                f"{t('watchdog')}: {job.watchdog_kills}\n"
+                f"{t('cooldowns')}: {job.cooldowns}"
             )
-        st.caption("سجل تجهيز المتصفح الكامل:")
+        st.caption(t("boot_log"))
         st.code(boot_msg, language="text")
-    with st.expander("🔬 اختبار سريع لرقم واحد"):
-        st.caption("يستعلم عن رقم واحد ويعرض الخطأ الكامل إن حدث (مفيد لتشخيص TargetClosedError).")
-        test_cid = normalize_civil_id(st.text_input("الرقم المدني للاختبار", value=""))
-        if st.button("▶ تشغيل الاختبار", disabled=running or len(test_cid) != 12):
-            with st.spinner("جاري الاختبار…"):
+    with st.expander("🔬 " + t("quick_test")):
+        st.caption(t("quick_test_help"))
+        test_cid = normalize_civil_id(st.text_input(t("test_cid"), value=""))
+        if st.button("▶ " + t("run_test"), disabled=running or len(test_cid) != 12):
+            with st.spinner(t("testing")):
                 try:
                     report = _in_thread(lambda: run_quick_test(test_cid, timeout_s))
                 except Exception as exc:  # noqa: BLE001
                     report = f"{type(exc).__name__}: {exc}"
             st.code(report, language="text")
 
-ss = st.session_state
-ss.setdefault("input_df", None)
-ss.setdefault("input_name", None)
-
-uploaded = st.file_uploader("📂 اختر ملف Excel (test.xlsx)", type=["xlsx", "xlsm", "xls"])
-
-# ---- read & validate the upload (only when the file changes) -------------- #
-if uploaded is not None and uploaded.name != ss.input_name:
-    try:
-        df_in = pd.read_excel(uploaded, dtype={COL_CID: str})
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"تعذر قراءة الملف: {exc}")
-        st.stop()
-    df_in.columns = [str(c).strip() for c in df_in.columns]
-    missing = [c for c in REQUIRED_COLS if c not in df_in.columns]
-    if missing:
-        st.error("الأعمدة التالية غير موجودة في الملف: " + " ، ".join(missing))
-        st.write("الأعمدة الموجودة:", list(df_in.columns))
-        st.stop()
-    for c in (COL_MOI, COL_RENEW, COL_STATUS):
-        df_in[c] = df_in[c].astype("object")
-    df_in[COL_CID] = df_in[COL_CID].apply(normalize_civil_id)
-    ss.input_df, ss.input_name = df_in, uploaded.name
+# ---- flash message -------------------------------------------------------- #
+if ss.flash:
+    st.success(t(ss.flash))
+    ss.flash = None
 
 if running:
-    st.info(f"⏳ يوجد استعلام قيد التنفيذ منذ {job.started_at:%H:%M:%S} — "
-            "يمكنك إغلاق الصفحة والعودة لاحقاً؛ التقدم محفوظ على الخادم.")
+    st.info("⏳ " + t("running_banner", time=f"{job.started_at:%H:%M:%S}"))
 
-if ss.input_df is not None:
-    df = ss.input_df
-    st.subheader("📋 معاينة الملف")
-    st.dataframe(df, width="stretch", height=240)
-    st.info(f"عدد الصفوف: {len(df)}  —  أرقام مدنية صالحة (12 رقم): {(df[COL_CID].str.len() == 12).sum()}")
+# ---- upload card ---------------------------------------------------------- #
+with st.container(border=True):
+    card_title("📂", t("upload_title"))
+    st.caption(t("upload_help", cols=" ، ".join(f"`{c}`" for c in REQUIRED_COLS)))
+    uploaded = st.file_uploader(t("upload_label"), type=["xlsx", "xlsm", "xls"],
+                                key=f"uploader_{ss.uploader_key}", label_visibility="collapsed")
 
-    c1, c2 = st.columns(2)
-    start_clicked = c1.button("🚀 بدء الاستعلام", type="primary", width="stretch", disabled=running)
-    stop_clicked = c2.button("⏹ إيقاف", width="stretch", disabled=not running)
+    if uploaded is not None and uploaded.name != ss.input_name:
+        try:
+            df_in = pd.read_excel(uploaded, dtype={COL_CID: str})
+        except Exception as exc:  # noqa: BLE001
+            st.error(t("read_error", err=exc))
+            st.stop()
+        df_in.columns = [str(c).strip() for c in df_in.columns]
+        missing = [c for c in REQUIRED_COLS if c not in df_in.columns]
+        if missing:
+            st.error(t("missing_cols", cols=" ، ".join(missing)))
+            st.write(t("existing_cols"), list(df_in.columns))
+            st.stop()
+        for c in (COL_MOI, COL_RENEW, COL_STATUS):
+            df_in[c] = df_in[c].astype("object")
+        df_in[COL_CID] = df_in[COL_CID].apply(normalize_civil_id)
+        ss.input_df, ss.input_name = df_in, uploaded.name
+    if ss.input_df is not None:
+        st.caption("✅ " + t("file_loaded", name=ss.input_name))
 
-    if stop_clicked and job is not None:
-        job.stop_event.set()
+# ---- preview + actions card ---------------------------------------------- #
+start_clicked = stop_clicked = reset_clicked = False
+if ss.input_df is not None or job is not None:
+    with st.container(border=True):
+        card_title("📋", t("preview_title"), status_pill(job_state(job)))
+        if job is None and ss.input_df is not None:
+            # Live tiles move into the auto-refreshing progress card once a job exists.
+            job_tiles(ss.input_df, None)
+            st.dataframe(ss.input_df, width="stretch", height=240)
 
-    if start_clicked and not running:
-        job = ScrapeJob(
-            df.copy(),
-            dict(headless=headless, timeout_s=timeout_s, delay_s=delay_s, retries=retries,
-                 restart_every=restart_every, skip_filled=skip_filled,
-                 do_moi=do_moi, do_status=do_status, do_renew=do_renew),
-        )
-        set_job(job)
-        job.start()
-        running = True
-elif job is None:
+        b1, b2, b3 = st.columns(3)
+        can_start = ss.input_df is not None and not running
+        start_clicked = b1.button("🚀 " + t("start"), type="primary", width="stretch", disabled=not can_start)
+        stop_clicked = b2.button("⏹ " + t("stop"), width="stretch", disabled=not running)
+        reset_clicked = b3.button("🧹 " + t("reset"), width="stretch", disabled=running or (job is None and ss.input_df is None),
+                                  help=t("reset_help"))
+else:
+    st.caption("💡 " + t("empty_hint"))
+
+if reset_clicked:
+    reset_everything()
+    st.rerun()
+
+if stop_clicked and job is not None:
+    job.stop_event.set()
+
+if start_clicked and not running:
+    job = ScrapeJob(
+        ss.input_df.copy(),
+        dict(headless=headless, timeout_s=timeout_s, delay_s=delay_s, retries=retries,
+             restart_every=restart_every, skip_filled=skip_filled,
+             do_moi=do_moi, do_status=do_status, do_renew=do_renew),
+    )
+    set_job(job)
+    job.start()
+    st.rerun()  # redraw the whole page with the job present (status pill, buttons)
+
+if job is None:
     st.stop()
-
-if job is not None and ss.input_df is None:
-    # Re-attached after a reload: still offer stop.
-    if st.button("⏹ إيقاف", width="stretch", disabled=not running):
-        job.stop_event.set()
 
 
 # ---- live progress ------------------------------------------------------- #
@@ -1610,38 +1972,39 @@ PREVIEW_ROWS = 40
 
 
 def render_job(j: ScrapeJob) -> None:
+    card_title("📈", t("progress_title"), status_pill(job_state(j)))
+    job_tiles(j.df, j)
     pct = j.processed / j.total if j.total else 1.0
-    st.progress(min(pct, 1.0), text=f"الصف {j.processed} من {j.total} — {j.current}")
+    st.progress(min(pct, 1.0), text=t("progress_text", done=j.processed, total=j.total, cid=j.current))
     if j.running:
         elapsed = (datetime.now() - j.started_at).total_seconds()
         per_row = elapsed / j.processed if j.processed else 0.0
-        eta = per_row * (j.total - j.processed)
-        st.info(f"🔎 جاري الاستعلام… {j.current}  —  ~{per_row:.0f} ث/صف  —  "
-                f"الوقت المتبقي التقريبي: {eta / 60:.0f} دقيقة")
+        eta = per_row * (j.total - j.processed) / 60
+        st.info("🔎 " + t("eta_text", cid=j.current, per_row=per_row, eta=eta))
     elif j.error:
-        st.error(f"توقف التنفيذ بسبب خطأ: {j.error}")
+        st.error(t("err_stopped", err=j.error))
     elif j.stop_event.is_set():
-        st.warning("تم إيقاف التنفيذ. يمكنك تحميل النتائج الجزئية أدناه.")
+        st.warning(t("stopped_warning"))
     else:
-        st.success("انتهى الاستعلام لجميع الصفوف ✅")
+        st.success(t("finished_ok"))
 
     snap = j.snapshot()
     if j.running and j.total > PREVIEW_ROWS:
         # Only ship a window around the current row every tick: sending all
         # 735 rows over the websocket every second is what made the UI crawl.
         lo = max(0, j.processed - PREVIEW_ROWS + 5)
-        st.caption(f"عرض الصفوف {lo + 1}–{min(lo + PREVIEW_ROWS, j.total)} (النتائج الكاملة في ملف التحميل)")
+        st.caption(t("preview_window", lo=lo + 1, hi=min(lo + PREVIEW_ROWS, j.total)))
         st.dataframe(snap.iloc[lo:lo + PREVIEW_ROWS], width="stretch", height=320)
     else:
         st.dataframe(snap, width="stretch", height=320)
 
-    with st.expander("سجل التنفيذ", expanded=False):
+    with st.expander("🧾 " + t("log_title"), expanded=False):
         with j.lock:
             text = "\n".join(j.logs[-200:])
         st.code(text or "…", language="text")
 
     st.download_button(
-        "📥 تحميل ملف Excel " + ("(النتائج الجزئية حتى الآن)" if j.running else "المحدث"),
+        "📥 " + (t("download_partial") if j.running else t("download_final")),
         data=j.excel_bytes(),
         file_name=f"results_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1651,7 +2014,7 @@ def render_job(j: ScrapeJob) -> None:
     )
 
 
-if job is not None:
+with st.container(border=True):
     if hasattr(st, "fragment"):
         # Non-blocking: the script run finishes immediately and only this block
         # re-executes every 2 s. Streamlit stays responsive (stop button,
