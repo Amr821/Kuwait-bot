@@ -930,8 +930,10 @@ class GovScraper:
         "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     )
 
-    def __init__(self, headless: bool = True, timeout_s: int = 40, log=None):
+    def __init__(self, headless: bool = True, timeout_s: int = 40, log=None,
+                 block_trackers: bool = True):
         self.headless = headless
+        self.block_trackers = block_trackers
         self.timeout_ms = timeout_s * 1000
         # One lookup = at most goto + wait (each ≤ timeout) + slack. If Playwright
         # is still blocked past this, the watchdog kills Chromium.
@@ -1044,12 +1046,10 @@ class GovScraper:
         self._log(f"🔁 تبديل إعدادات تشغيل المتصفح إلى '{profile_name()}' ({why}).")
         return True
 
-    @staticmethod
-    def _route(route, request):
+    def _route(self, route, request):
         if request.resource_type in BLOCKED_RESOURCE_TYPES:
             return route.abort()
-        url = request.url
-        if any(part in url for part in BLOCKED_URL_PARTS):
+        if self.block_trackers and any(part in request.url for part in BLOCKED_URL_PARTS):
             return route.abort()
         return route.continue_()
 
@@ -1330,7 +1330,8 @@ class ScrapeJob:
         ]
         scraper = None
         try:
-            scraper = GovScraper(headless=o["headless"], timeout_s=o["timeout_s"], log=self.log)
+            scraper = GovScraper(headless=o["headless"], timeout_s=o["timeout_s"], log=self.log,
+                                 block_trackers=o.get("block_trackers", True))
             self.scraper = scraper
             self.log(f"تم تشغيل Chromium. {memory_report()}".strip())
             rows_since_restart = 0
@@ -1493,6 +1494,11 @@ T: dict[str, dict[str, str]] = {
         "boot_spinner": "جاري تجهيز المتصفح (يحدث مرة واحدة عند أول تشغيل)…",
         "boot_error": "تعذر تثبيت/تشغيل Chromium. راجع سجل الخطأ أدناه و requirements.txt.",
         "settings": "الإعدادات",
+        "advanced": "إعدادات متقدمة",
+        "advanced_help": "المهلات والفواصل الزمنية وإعادة التشغيل — القيم الافتراضية مناسبة لمعظم الحالات.",
+        "block_trackers": "حظر أدوات التتبع والإعلانات",
+        "block_trackers_help": "يمنع طلبات التحليلات والإعلانات الخارجية لتسريع الاستعلام وتقليل الذاكرة (لا يؤثر على reCAPTCHA).",
+        "diagnostics": "التشخيص",
         "cloud_note": "بيئة خادم بدون شاشة — المتصفح يعمل في الخلفية إجبارياً.",
         "headless": "تشغيل المتصفح في الخلفية (Headless)",
         "timeout": "مهلة انتظار النتيجة (ثانية)",
@@ -1560,6 +1566,11 @@ T: dict[str, dict[str, str]] = {
         "boot_spinner": "Preparing the browser (one-time setup on first run)…",
         "boot_error": "Could not install/launch Chromium. See the error log below and requirements.txt.",
         "settings": "Settings",
+        "advanced": "Advanced settings",
+        "advanced_help": "Timeouts, delays and browser recycling — the defaults suit most runs.",
+        "block_trackers": "Block trackers & ads",
+        "block_trackers_help": "Aborts third-party analytics/ad requests to speed up lookups and save memory (reCAPTCHA is unaffected).",
+        "diagnostics": "Diagnostics",
         "cloud_note": "Headless server environment — the browser always runs in the background.",
         "headless": "Run browser in background (headless)",
         "timeout": "Result timeout (seconds)",
@@ -1855,21 +1866,30 @@ running = job is not None and job.running
 # ---- sidebar -------------------------------------------------------------- #
 with st.sidebar:
     st.header("⚙️ " + t("settings"))
-    if ON_CLOUD:
-        st.caption("🖥️ " + t("cloud_note"))
-        headless = True
-    else:
-        headless = st.toggle(t("headless"), value=True)
-    timeout_s = st.slider(t("timeout"), 10, 120, 45)
-    delay_s = st.slider(t("delay"), 0.0, 10.0, 2.0, 0.5)
-    retries = st.slider(t("retries"), 0, 3, 1)
-    restart_every = st.slider(t("restart_every"), 10, 200, 20 if ON_CLOUD else 40, 10)
-    skip_filled = st.checkbox(t("skip_filled"), value=True, help=t("skip_filled_help"))
-    st.markdown("---")
+
+    # -- what to look up (the everyday controls) --
     st.markdown(f"**{t('services')}**")
     do_moi = st.checkbox(t("svc_moi"), value=True)
     do_status = st.checkbox(t("svc_status"), value=True)
     do_renew = st.checkbox(t("svc_renew"), value=True)
+    skip_filled = st.checkbox(t("skip_filled"), value=True, help=t("skip_filled_help"))
+
+    # -- tuning, collapsed by default --
+    with st.expander("🛠️ " + t("advanced"), expanded=False):
+        st.caption(t("advanced_help"))
+        if ON_CLOUD:
+            st.caption("🖥️ " + t("cloud_note"))
+            headless = True
+        else:
+            headless = st.toggle(t("headless"), value=True)
+        timeout_s = st.slider(t("timeout"), 10, 120, 45)
+        delay_s = st.slider(t("delay"), 0.0, 10.0, 2.0, 0.5)
+        retries = st.slider(t("retries"), 0, 3, 1)
+        restart_every = st.slider(t("restart_every"), 10, 200, 20 if ON_CLOUD else 40, 10)
+        block_trackers = st.toggle(t("block_trackers"), value=True, help=t("block_trackers_help"))
+
+    st.markdown(f"<div style='opacity:.6;font-size:.8rem;margin-top:.8rem'>{t('diagnostics')}</div>",
+                unsafe_allow_html=True)
     with st.expander("🧭 " + t("sysinfo")):
         st.code(f"python {platform.python_version()} / {platform.system()}\n{boot_msg.splitlines()[0]}")
         if job is not None:
@@ -1956,7 +1976,7 @@ if start_clicked and not running:
     job = ScrapeJob(
         ss.input_df.copy(),
         dict(headless=headless, timeout_s=timeout_s, delay_s=delay_s, retries=retries,
-             restart_every=restart_every, skip_filled=skip_filled,
+             restart_every=restart_every, skip_filled=skip_filled, block_trackers=block_trackers,
              do_moi=do_moi, do_status=do_status, do_renew=do_renew),
     )
     set_job(job)
